@@ -62,6 +62,16 @@ static MotorConfig g_cfg = {
 static bool debug_mode = false;
 static bool limits_seeded = false;
 
+// Moved here from below so parse_modern_layout can apply config-time inversion.
+enum motor_inversion {
+  MOTOR_NO_INVERSION = 0x0,
+  MOTOR_INVERT_X = 0x1,
+  MOTOR_INVERT_Y = 0x2,
+  MOTOR_INVERT_BOTH = 0x3
+};
+
+enum motor_inversion motor_inversion_state = MOTOR_NO_INVERSION;
+
 static bool value_is_truthy(const char *value) {
   if (!value || !*value)
     return false;
@@ -297,6 +307,19 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
     g_cfg.hw.gpio_invert = bool_value;
     parsed = true;
   }
+  // Apply config-time axis inversion (invert_x / invert_y from thingino.json).
+  // These XOR into motor_inversion_state so runtime IPC toggles still work.
+  bool invert_x = false, invert_y = false;
+  if (json_get_bool_jct(motors, "invert_x", &invert_x)) {
+    if (invert_x)
+      motor_inversion_state ^= MOTOR_INVERT_X;
+    parsed = true;
+  }
+  if (json_get_bool_jct(motors, "invert_y", &invert_y)) {
+    if (invert_y)
+      motor_inversion_state ^= MOTOR_INVERT_Y;
+    parsed = true;
+  }
   if (json_get_bool_jct(motors, "homing", &bool_value)) {
     g_cfg.hw.homing = bool_value;
     parsed = true;
@@ -461,16 +484,6 @@ enum motor_status {
   MOTOR_IS_STOP,
   MOTOR_IS_RUNNING,
 };
-
-enum motor_inversion {
-  MOTOR_NO_INVERSION = 0x0, // No inversion
-  MOTOR_INVERT_X = 0x1,     // Invert X only
-  MOTOR_INVERT_Y = 0x2,     // Invert Y only
-  MOTOR_INVERT_BOTH = 0x3   // Invert both X and Y
-};
-
-enum motor_inversion motor_inversion_state =
-    MOTOR_NO_INVERSION; // Default is no inversion
 
 struct request {
   char command; // d,r,s,p,b,S,i,j (move, reset,set speed,get position, is
@@ -745,10 +758,22 @@ void motor_status_get(struct motor_message *msg) {
   // Single source of truth: when configured, always expose configured limits.
   // This keeps status, homing, clamping, and API responses consistent.
   if (g_cfg.loaded) {
-    if (g_cfg.pan.max_steps > 0)
+    if (g_cfg.pan.max_steps > 0) {
       msg->x_max_steps = (unsigned int)g_cfg.pan.max_steps;
-    if (g_cfg.tilt.max_steps > 0)
+      // Clamp reported position to configured range to prevent drift past
+      // limits (e.g. when invert_y causes the kernel counter to overshoot).
+      if (msg->x < 0)
+        msg->x = 0;
+      if (msg->x > (int)g_cfg.pan.max_steps)
+        msg->x = (int)g_cfg.pan.max_steps;
+    }
+    if (g_cfg.tilt.max_steps > 0) {
       msg->y_max_steps = (unsigned int)g_cfg.tilt.max_steps;
+      if (msg->y < 0)
+        msg->y = 0;
+      if (msg->y > (int)g_cfg.tilt.max_steps)
+        msg->y = (int)g_cfg.tilt.max_steps;
+    }
   }
 
   msg->inversion_state = (unsigned int)motor_inversion_state;
