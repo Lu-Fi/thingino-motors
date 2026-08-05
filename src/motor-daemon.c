@@ -546,6 +546,7 @@ static bool motion_is_cancelled(unsigned int generation);
 static void write_motion_active_flag(void);
 static void remove_motion_active_flag(void);
 static int get_motion_timeout_ms(void);
+static void physical_delta_to_steps(int *dx, int *dy);
 
 static int sanitize_requested_speed(int requested, int fallback) {
   int speed = (requested > 0) ? requested : fallback;
@@ -822,6 +823,7 @@ void motor_set_position(int xpos, int ypos, int stepspeed) {
          " -> set position current X: %d, Y: %d, steps required X: %d, Y: %d, "
          "speed %d\n",
          msg.x, msg.y, deltax, deltay, eff_speed);
+  physical_delta_to_steps(&deltax, &deltay);
   motor_steps(deltax, deltay, eff_speed);
   syslog(LOG_DEBUG, "Finished setting absolute move");
 }
@@ -1033,6 +1035,21 @@ static int start_profiled_move_async(int xsteps, int ysteps, int speed) {
   return 0;
 }
 
+// motor_steps_impl() unconditionally applies motor_inversion_state to every
+// delta it is handed (correct for 'g', whose x/y are a logical jog
+// direction). Callers that instead compute their delta as
+// raw_target - motor_status_get()'s raw, uninverted current position (the
+// 'h' absolute move, and the homing center correction) already have a
+// physical delta, so that later inversion would flip it a second time.
+// Pre-invert here so the two inversions cancel back out to the original
+// physical delta.
+static void physical_delta_to_steps(int *dx, int *dy) {
+  if (motor_inversion_state & MOTOR_INVERT_X)
+    *dx = -*dx;
+  if (motor_inversion_state & MOTOR_INVERT_Y)
+    *dy = -*dy;
+}
+
 static void dispatch_profiled_move(int xsteps, int ysteps, int speed,
                                    const char *log_tag) {
   if (start_profiled_move_async(xsteps, ysteps, speed) == 0) {
@@ -1176,6 +1193,7 @@ static int enhanced_homing_daemon(int stepspeed) {
              "Enhanced homing center correction: current=%d,%d target=%d,%d "
              "delta=%d,%d",
              status.x, status.y, center_x, center_y, corr_dx, corr_dy);
+      physical_delta_to_steps(&corr_dx, &corr_dy);
       motor_steps(corr_dx, corr_dy, stepspeed);
       if (wait_until_idle(t3_ms, 100) != 0) {
         syslog(LOG_DEBUG,
@@ -1659,6 +1677,7 @@ int main(int argc, char *argv[]) {
 
             request_message.x = target_x;
             request_message.y = target_y;
+            physical_delta_to_steps(&rel_x, &rel_y);
             dispatch_profiled_move(rel_x, rel_y, request_speed,
                                   "Profiled driver absolute move started");
           }
