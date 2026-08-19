@@ -38,11 +38,15 @@ static bool debug_mode = false;
 enum motor_status {
   MOTOR_IS_STOP,
   MOTOR_IS_RUNNING,
+  // Only ever received as the status field of the 'R' (reload) ack; see the
+  // matching enum in motor-daemon.c. Values must stay identical between the
+  // two copies.
+  MOTOR_RELOAD_FAILED,
 };
 
 struct request {
-  char command; // d,r,s,p,b,S,i,j (move, reset,set speed,get position, is
-                // busy,Status,initial,JSON)
+  char command; // d,r,s,p,b,S,i,j,R (move, reset,set speed,get position, is
+                // busy,Status,initial,JSON,Reload config)
   char type;    // g,h,c,s (absolute,relative,cruise,stop)
   int x;
   int got_x;
@@ -334,7 +338,7 @@ int main(int argc, char *argv[]) {
     exit(EXIT_FAILURE);
   debug_log("Connected to %s (fd=%d)", SV_SOCK_PATH, serverfd);
 
-  while ((c = getopt(argc, argv, "d:s:x:y:jipSrvbI:D")) != -1) {
+  while ((c = getopt(argc, argv, "d:s:x:y:jipSrvbI:DR")) != -1) {
     switch (c) {
     case 'd':
       request_message.command = 'd';
@@ -454,6 +458,44 @@ int main(int argc, char *argv[]) {
       log_request("TX", &request_message);
       write(serverfd, &request_message, sizeof(struct request));
       return 0;
+    case 'R': { // ask the daemon to reload its config from /etc/thingino.json
+      request_message.command = 'R';
+      has_command = true;
+      if (verbose)
+        print_request_message(&request_message);
+      log_request("TX", &request_message);
+      write(serverfd, &request_message, sizeof(struct request));
+
+      struct motor_message reloaded;
+      ssize_t reload_n =
+          read(serverfd, &reloaded, sizeof(struct motor_message));
+      if (reload_n != (ssize_t)sizeof(struct motor_message)) {
+        // An older daemon has no 'R' handler: it silently drops the request
+        // and closes the connection, so read() returns 0. Fail loudly rather
+        // than pretending the reload happened.
+        fprintf(stderr,
+                "Reload not acknowledged; is the running motors-daemon too "
+                "old to support -R?\n");
+        return EXIT_FAILURE;
+      }
+      debug_log("RX reload ack: x=%d y=%d speed=%d invert=%u status=%d",
+                reloaded.x, reloaded.y, reloaded.speed,
+                reloaded.inversion_state, reloaded.status);
+
+      if (reloaded.status == MOTOR_RELOAD_FAILED) {
+        // Daemon left /etc/thingino.json unreadable/invalid and reset to
+        // defaults instead of applying it; see its syslog for the reason.
+        fprintf(stderr,
+                "Reload FAILED: /etc/thingino.json is missing, unreadable, "
+                "or not valid JSON; motors-daemon reset to default config "
+                "instead. Check syslog on the camera for details.\n");
+        JSON_status(&reloaded);
+        return EXIT_FAILURE;
+      }
+
+      JSON_status(&reloaded);
+      return 0;
+    }
     case 'b': // is moving?
       request_message.command = 'b';
       has_command = true;
@@ -487,7 +529,9 @@ int main(int argc, char *argv[]) {
           "\t -p return xpos,ypos as a string\n"
           "\t -b prints 1 if motor is (b)usy moving or 0 if is not\n"
           "\t -S show status\n"
-          "\t -I Invert motor direction with 'x', 'y', or 'b' for both axes\n",
+          "\t -I Invert motor direction with 'x', 'y', or 'b' for both axes\n"
+          "\t -R reload daemon config from /etc/thingino.json (invert_x/"
+          "invert_y, speeds, accel, timeouts, pos_0) without restarting\n",
           argv[0]);
       exit(EXIT_FAILURE);
     }
