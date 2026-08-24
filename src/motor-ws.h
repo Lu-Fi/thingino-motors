@@ -21,6 +21,46 @@
  * of the streamer's HTTP/RTSP ports. */
 #define MOTOR_WS_DEFAULT_PORT 8089
 
+/* Continuous ("hold to move") control: a CLIENT CONVENTION, not a wire mode.
+ *
+ * Hold a direction, the camera moves until you let go. There is deliberately
+ * no {"mode":"cont"} for this, because the two primitives that already exist
+ * express it exactly:
+ *
+ *   pointerdown -> {"cmd":"move","mode":"rel","x":<+/- x_max>}
+ *   pointerup   -> {"cmd":"stop"}
+ *
+ * and the daemon does the right thing with both, verified against the
+ * handlers rather than assumed:
+ *
+ *  - Clamping. motor_ctl_relative() adds the delta to the current position,
+ *    clamps the TARGET to the runtime travel limit, and recomputes the delta
+ *    from the clamped target. An oversized delta therefore becomes exactly
+ *    "the distance remaining to that limit" - the client does not need to
+ *    know the travel to ask for all of it.
+ *
+ *  - No magic number needed. Every "hello"/"status" frame carries x_max and
+ *    y_max, so a client sends +/-x_max and gets a clean full-travel move.
+ *    That is also the honest failure signal: a camera whose limits are
+ *    unknown reports x_max = 0, and a client that sees 0 must fall back to
+ *    fixed-size steps rather than inventing a large constant - with no limit
+ *    to clamp against, motor_ctl_relative() would pass that constant to the
+ *    hardware verbatim.
+ *
+ *  - Holding at the limit is a no-op, not an oscillation. The 24-step edge
+ *    deadband in motor_ctl_relative() collapses "already at the edge, asked
+ *    to go further" to a zero delta, which run_profiled_move() returns from
+ *    immediately.
+ *
+ *  - Release cancels mid-flight. motor_ctl_stop() bypasses the command mutex
+ *    (see motor-ctl.h) so it reaches MOTOR_STOP immediately even while a move
+ *    is in progress; the generation bump then makes the in-flight profile
+ *    abort at its next phase boundary instead of continuing to the target.
+ *
+ * The one thing that did NOT already work is the wait budget - see
+ * chunk_timeout_ms() in motor-daemon.c. A full-travel chunk does not fit the
+ * fixed nudge-sized timeout that every wait here used to share. */
+
 typedef struct {
   bool enabled;
   int port;

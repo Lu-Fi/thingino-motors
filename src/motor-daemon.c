@@ -703,6 +703,7 @@ static void write_motion_active_flag(void);
 static void remove_motion_active_flag(void);
 static void start_motion_active_tracker(void);
 static int get_motion_timeout_ms(void);
+static int chunk_timeout_ms(int steps, int speed, int floor_ms);
 static void physical_delta_to_steps(int *dx, int *dy);
 
 // Derive the default speed from the loaded config. Shared between startup
@@ -782,7 +783,11 @@ static void motor_steps_impl(int xsteps, int ysteps, int stepspeed,
 
     motor_set_axis_speed(eff_speed_x, eff_speed_y);
     motor_ioctl(MOTOR_MOVE, &x_only);
-    if (wait_until_idle(timeout_ms, 10) != 0)
+    // Same distance-scaling as run_profiled_move()'s waits: a diagonal
+    // hold-to-move puts a full-travel X leg here, which does not fit the
+    // fixed nudge-sized budget. See chunk_timeout_ms().
+    if (wait_until_idle(chunk_timeout_ms(steps.x, eff_speed_x, timeout_ms),
+                        10) != 0)
       return;
 
     motor_set_axis_speed(eff_speed_x, eff_speed_y);
@@ -988,8 +993,11 @@ static int execute_profile_phase(int total, int phase_end, int xsteps,
     return 0;
 
   motor_steps_impl(chunk_x, chunk_y, speed_now, false);
-  if (wait_until_idle(timeout_ms, 10) != 0)
-    return -1;
+  {
+    int chunk = (abs(chunk_x) > abs(chunk_y)) ? abs(chunk_x) : abs(chunk_y);
+    if (wait_until_idle(chunk_timeout_ms(chunk, speed_now, timeout_ms), 10) != 0)
+      return -1;
+  }
 
   return 0;
 }
@@ -1037,6 +1045,53 @@ static int get_motion_timeout_ms(void) {
   if (to_s <= 0)
     to_s = 10;
   return to_s * 1000;
+}
+
+// Time budget for waiting out ONE chunk of driver motion.
+//
+// get_motion_timeout_ms() is a FIXED budget (motors.timeout_pan/timeout_tilt,
+// 10 s when unset - and it is unset on every camera in this fleet). That was
+// fine while every move through here was a UI nudge: the old WebUI fires
+// steps_pan/100 = 40 steps per tick, which finishes in a twentieth of a
+// second. It stops being fine for a hold-to-move gesture, which is expressed
+// as a relative delta larger than the travel and clamped by
+// motor_ctl_relative() into "go to the far limit" - a single chunk of up to
+// steps_pan (4000) steps. enhanced_homing_daemon() budgets 15 s for exactly
+// that distance, more than the 10 s default this function has to work with,
+// and a camera configured with speed_pan=300 needs more like 13 s.
+//
+// Overrunning is not benign, which is why this is worth fixing rather than
+// documenting. wait_until_idle() failing makes execute_profile_phase() (or
+// the accel<=0 fast path) return -1 WITHOUT ever issuing MOTOR_STOP, so the
+// hardware carries on to the end of the chunk while async_move_worker()
+// concludes the move is over and clears MOTOR_ACTIVE_FLAG - the motion-active
+// flag then lies to every other consumer for the rest of the physical move.
+//
+// So scale the budget by the distance actually commanded. The driver steps at
+// roughly `speed` steps per second; x2 covers the acceleration ramp inside
+// the driver, scheduling on a busy MIPS core, and the 10 ms polling
+// granularity of wait_until_idle() itself. floor_ms keeps the configured
+// fixed budget as a lower bound, so no move that completes today is given a
+// tighter deadline than it has now.
+static int chunk_timeout_ms(int steps, int speed, int floor_ms) {
+  long long est;
+
+  if (steps < 0)
+    steps = -steps;
+  if (speed < MOTOR1_MIN_SPEED)
+    speed = MOTOR1_MIN_SPEED;
+
+  est = ((long long)steps * 1000LL * 2LL) / (long long)speed;
+
+  if (est < (long long)floor_ms)
+    est = (long long)floor_ms;
+  // Absolute ceiling. speed is already clamped to >= 1 above, so a
+  // pathological speed=1 with a full-travel delta would otherwise ask
+  // wait_until_idle() to spin for over two hours.
+  if (est > 120000LL)
+    est = 120000LL;
+
+  return (int)est;
 }
 
 static int get_effective_accel(void) {
@@ -1115,11 +1170,14 @@ static int run_profiled_move(int xsteps, int ysteps, int requested_speed,
 
   int accel = get_effective_accel();
 
+  // accel<=0 is the DEFAULT on this fleet (motors.json ships accel_pan and
+  // accel_tilt as 0), so this - not the trapezoid below - is the path a
+  // hold-to-move gesture normally takes: one chunk covering the whole travel.
   if (accel <= 0 || total < 8) {
     if (motion_is_cancelled(generation))
       return -1;
     motor_steps(xsteps, ysteps, max_speed);
-    if (wait_until_idle(timeout_ms, 10) != 0)
+    if (wait_until_idle(chunk_timeout_ms(total, max_speed, timeout_ms), 10) != 0)
       return -1;
     return motion_is_cancelled(generation) ? -1 : 0;
   }
