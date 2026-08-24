@@ -305,6 +305,74 @@ static void test_frames(void) {
   }
 }
 
+/* --- liveness stamp ----------------------------------------------------
+ *
+ * The connection-level timeout in motor-ws.c is only as good as the stamp it
+ * reads, and the two properties that matter are easy to get subtly wrong:
+ * every complete frame must refresh it (not just PONG), and a frame that
+ * never finished arriving must not. Both are asserted here by backdating
+ * ws_conn.last_rx_ms rather than by sleeping, so the test stays instant. */
+
+#define BACKDATE_MS 600000
+
+static void test_liveness(void) {
+  int sp[2];
+  ws_conn c;
+  unsigned char out[WS_MAX_PAYLOAD + 1];
+  size_t len = 0;
+  int op = 0, rc;
+
+  puts("liveness stamp");
+
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) != 0) {
+    puts("  SKIP (socketpair failed)");
+    return;
+  }
+
+  ws_conn_init(&c, sp[0]);
+  check_int("fresh connection is not idle", ws_conn_idle_ms(&c) < 1000, 1);
+
+  /* a PONG is the case the timeout exists for: it carries no data, so before
+   * this change it left no trace the caller could observe at all */
+  c.last_rx_ms -= BACKDATE_MS;
+  check_int("backdated connection reads as stale",
+            ws_conn_idle_ms(&c) >= BACKDATE_MS, 1);
+  send_client_frame(sp[1], WS_OP_PONG, true, NULL, 0, true);
+  rc = ws_read_message(&c, &op, out, sizeof out, &len, 200);
+  check_int("pong still swallowed", rc, WS_AGAIN);
+  check_int("pong refreshed liveness", ws_conn_idle_ms(&c) < 1000, 1);
+
+  /* ... and so does ordinary traffic, which is what lets a client that cannot
+   * emit a PONG keep itself alive with {"cmd":"ping"} */
+  c.last_rx_ms -= BACKDATE_MS;
+  send_client_frame(sp[1], WS_OP_TEXT, true, (const unsigned char *)"{}", 2,
+                    true);
+  rc = ws_read_message(&c, &op, out, sizeof out, &len, 200);
+  check_int("text frame accepted", rc, WS_OK);
+  check_int("text frame refreshed liveness", ws_conn_idle_ms(&c) < 1000, 1);
+
+  close(sp[0]);
+  close(sp[1]);
+
+  /* A frame that starts and never finishes must NOT count. Otherwise a peer
+   * could hold a connection open forever by dribbling two header bytes per
+   * minute - the liveness timer would be feeding the very attack it exists to
+   * end. Two header bytes announcing a masked 2-byte payload, then silence. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
+    unsigned char torn[2] = {0x81, 0x82};
+    ws_conn_init(&c, sp[0]);
+    c.last_rx_ms -= BACKDATE_MS;
+    if (write(sp[1], torn, 2) == 2) {
+      rc = ws_read_message(&c, &op, out, sizeof out, &len, 100);
+      check_int("torn frame is a hard error", rc, WS_EIO);
+      check_int("torn frame did not refresh liveness",
+                ws_conn_idle_ms(&c) >= BACKDATE_MS, 1);
+    }
+    close(sp[0]);
+    close(sp[1]);
+  }
+}
+
 int main(void) {
   test_sha1();
   test_sha256();
@@ -312,6 +380,7 @@ int main(void) {
   test_accept_key();
   test_query();
   test_frames();
+  test_liveness();
 
   printf("\n%d checks, %d failure(s)\n", checks, failures);
   return failures ? 1 : 0;

@@ -17,7 +17,6 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <syslog.h>
 #include <unistd.h>
 
@@ -41,6 +40,37 @@
 /* Keepalive PING cadence. Also serves as the wakeup that notices a peer whose
  * socket has died without a FIN - the send fails and the thread exits. */
 #define WS_PING_INTERVAL_MS 20000
+
+/* Liveness deadline: close a connection that has not sent ANY frame for this
+ * long. ws_read_message() stamps ws_conn.last_rx_ms on every complete frame,
+ * so a browser answering our PINGs automatically (all of them do) keeps
+ * itself alive for free, and a client that cannot emit a PONG can keep itself
+ * alive just by sending {"cmd":"ping"} occasionally.
+ *
+ * Why three ping intervals (60 s) rather than one or two:
+ *
+ *  - One interval is a race, not a timeout. The check only runs when the read
+ *    loop wakes, which is every push_ms (50..5000 ms) or every 1000 ms when
+ *    the client has not subscribed, so the effective granularity is up to 5 s
+ *    on top of a 20 s budget. Three intervals leaves room for that jitter
+ *    plus two entirely lost PING/PONG round trips.
+ *
+ *  - These are WiFi cameras. A re-association or an AP roam routinely eats
+ *    10-30 s of a TCP connection that then recovers perfectly well. Tearing
+ *    down a PTZ control socket during a hiccup it would have survived is a
+ *    worse failure than holding a dead one for another 20 s: a stale
+ *    connection costs one of ws_max_clients (4) slots and one 64 KB thread
+ *    stack, and nothing else - it issues no commands and moves no motors.
+ *    So the bias is deliberately toward forgiving.
+ *
+ *  - Something has to reclaim the slot, though, and the OS will not do it in
+ *    any useful time. SO_KEEPALIVE is set on these sockets, but with stock
+ *    Linux sysctls that is tcp_keepalive_time (7200 s) + 9 x 75 s before the
+ *    kernel gives up - over two hours, during which a laptop that closed its
+ *    lid mid-session holds a quarter of the connection budget. Closing the
+ *    gap between "two hours" and "instantly" is the entire job of this
+ *    constant, and 60 s sits comfortably inside it. */
+#define WS_LIVENESS_TIMEOUT_MS (3 * WS_PING_INTERVAL_MS)
 
 /* Even a client that subscribed to pushes gets a status frame at least this
  * often while idle, so a UI that missed one update self-heals. */
@@ -101,11 +131,17 @@ typedef struct {
  * helpers
  * ------------------------------------------------------------------ */
 
-static long long now_ms(void) {
-  struct timeval tv;
-  gettimeofday(&tv, NULL);
-  return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
-}
+/* One clock for the whole frontend, shared with ws.c's liveness stamp.
+ *
+ * It is monotonic now (see ws_now_ms()). Every use below - the ping cadence,
+ * the push cadence, the heartbeat, the rate-limiter bucket, the liveness
+ * deadline - measures an INTERVAL, never a date, so monotonic is strictly the
+ * correct source for all of them. Under the previous gettimeofday() the first
+ * NTP sync after boot (these cameras have no RTC, so that step is routinely
+ * hours or years) would jump every one of those timers at once; for the
+ * liveness deadline that would not merely skew a cadence, it would drop every
+ * open connection. */
+static long long now_ms(void) { return ws_now_ms(); }
 
 static int clampi(int v, int lo, int hi) {
   return (v < lo) ? lo : ((v > hi) ? hi : v);
@@ -595,6 +631,25 @@ static int periodic(ws_client *c) {
   }
 
 keepalive:
+  /* Liveness first, so a peer that is already past the deadline is closed on
+   * this pass rather than getting one more PING it will never answer.
+   *
+   * The failure this catches is specifically the one TCP cannot: a peer whose
+   * host vanished without a FIN - suspended laptop, yanked ethernet, a WiFi
+   * client that left the cell. Writes to such a socket keep succeeding into
+   * the kernel's send buffer for a long time, so ws_send_ping() below returns
+   * WS_OK and the connection looks perfectly healthy from the write side. The
+   * only evidence available is the absence of anything coming back. */
+  if (ws_conn_idle_ms(&c->ws) >= WS_LIVENESS_TIMEOUT_MS) {
+    syslog(LOG_INFO, "ws: %s silent for %ds, closing stale connection", c->peer,
+           WS_LIVENESS_TIMEOUT_MS / 1000);
+    ws_send_close(c->fd, WS_CLOSE_GOING_AWAY, "keepalive timeout");
+    /* WS_CLOSED, not WS_EIO: the socket is fine, we are the ones ending this.
+     * conn_thread() treats every non-WS_OK the same, but the distinction is
+     * worth keeping honest for anything that reads this later. */
+    return WS_CLOSED;
+  }
+
   if ((now - c->last_ping_ms) >= WS_PING_INTERVAL_MS) {
     if (ws_send_ping(c->fd) != WS_OK)
       return WS_EIO;

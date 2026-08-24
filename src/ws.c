@@ -15,6 +15,8 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "sha1.h"
@@ -22,6 +24,27 @@
 
 /* RFC 6455 section 1.3. Fixed by the spec, not a secret, not a salt. */
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+/* ------------------------------------------------------------------ *
+ * clock
+ * ------------------------------------------------------------------ */
+
+long long ws_now_ms(void) {
+#ifdef CLOCK_MONOTONIC
+  struct timespec ts;
+  /* uClibc-ng implements clock_gettime() in libc (no -lrt), and CLOCK_MONOTONIC
+   * has been in the 3.10 Ingenic kernels since forever. The gettimeofday()
+   * fallback below is only there so this file stays portable to a host that
+   * lacks it - it is not expected to be taken on the target. */
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+    return (long long)ts.tv_sec * 1000LL + ts.tv_nsec / 1000000L;
+#endif
+  {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+  }
+}
 
 /* ------------------------------------------------------------------ *
  * base64
@@ -151,6 +174,15 @@ static int write_all(int fd, const void *buf, size_t n) {
 void ws_conn_init(ws_conn *c, int fd) {
   memset(c, 0, sizeof(*c));
   c->fd = fd;
+  /* Seed from "now", not from zero: a connection that has just been accepted
+   * has not been silent since the epoch, and a zero here would make the very
+   * first liveness check fire immediately. */
+  c->last_rx_ms = ws_now_ms();
+}
+
+long long ws_conn_idle_ms(const ws_conn *c) {
+  long long d = ws_now_ms() - c->last_rx_ms;
+  return (d < 0) ? 0 : d;
 }
 
 /* Copy a header value into out, stopping at CR/LF. Values are cut at the line
@@ -490,6 +522,14 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
         payload[i] ^= mask[i & 3];
     }
 
+    /* Liveness stamp. Deliberately here and not at the top of the loop: only a
+     * frame that arrived COMPLETE and well-formed counts as proof of life. A
+     * peer that dribbles two header bytes and then stalls forever must not be
+     * able to hold the connection open by feeding the liveness timer, which is
+     * exactly the slow-loris shape read_exact()'s deadline already defends
+     * against on a single frame. */
+    c->last_rx_ms = ws_now_ms();
+
     if (is_control) {
       /* Handled here so the caller's command loop never sees the control
        * plane. A PING may arrive in the middle of a fragmented message, and
@@ -501,8 +541,11 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
         if (ws_send_frame(c->fd, WS_OP_PONG, payload, (size_t)plen) != WS_OK)
           return WS_EIO;
       }
-      /* WS_OP_PONG: nothing to do. The keepalive in motor-ws.c treats "any
-       * traffic" as liveness, so an unsolicited pong is harmless. */
+      /* WS_OP_PONG: nothing further to do - the stamp above is the whole
+       * point of receiving one. The keepalive in motor-ws.c treats "any
+       * traffic" as liveness, so an unsolicited pong is harmless (it can at
+       * worst keep a connection that is talking to us alive, which is the
+       * answer we wanted anyway). */
       continue;
     }
 

@@ -94,9 +94,30 @@ typedef struct {
   unsigned char frag[WS_MAX_PAYLOAD];
   size_t frag_len;
   int frag_op; /* opcode of the message being reassembled, 0 when idle */
+  /* Liveness. Stamped by ws_read_message() every time a COMPLETE, well-formed
+   * frame of any kind arrives - PONG, PING, CLOSE, a data frame, or one
+   * fragment of one. "Any frame" rather than "a PONG" on purpose: a PONG is
+   * only the cheapest proof a peer is alive, not the only one, and a client
+   * that never answers PINGs but does send commands is plainly not stale.
+   * Read it through ws_conn_idle_ms(). */
+  long long last_rx_ms;
 } ws_conn;
 
 void ws_conn_init(ws_conn *c, int fd);
+
+/* Milliseconds since an arbitrary fixed point, from CLOCK_MONOTONIC where the
+ * platform has it. Exposed because every timer in this frontend has to agree
+ * on one clock, and because a monotonic one is the only correct source for an
+ * interval that can DISCONNECT someone: these cameras have no RTC, so the
+ * wall clock takes a large forward step the moment NTP first syncs after boot
+ * - which under gettimeofday() would look exactly like every open connection
+ * simultaneously falling silent for hours. */
+long long ws_now_ms(void);
+
+/* How long since the peer last sent anything at all. The caller decides what
+ * to do about it; see WS_LIVENESS_TIMEOUT_MS in motor-ws.c for this project's
+ * policy. */
+long long ws_conn_idle_ms(const ws_conn *c);
 
 /* --- handshake --- */
 
