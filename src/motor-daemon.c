@@ -837,6 +837,13 @@ static void compute_axis_speeds(int requested_speed, int *x_speed,
     *y_speed = ys;
 }
 
+// Whether MOTOR_SPEED_AXIS (ioctl 0x8) exists on this kernel. Learned on the
+// first attempt and never re-probed. Callers that only want to know how to
+// SHAPE a request read it through motor_axis_speed_supported(); the ioctl
+// itself always tries the per-axis form first and falls back on its own, so
+// this is a hint, not a gate.
+static bool axis_speed_supported = true;
+
 static void motor_set_axis_speed(int x_speed, int y_speed) {
   static bool axis_speed_unsupported_logged = false;
 
@@ -852,6 +859,7 @@ static void motor_set_axis_speed(int x_speed, int y_speed) {
   // Some kernels do not support per-axis speed ioctl (0x8).
   if ((errno == EINVAL || errno == ENOTTY || errno == ENOSYS)) {
     int fallback_speed = (x_speed < y_speed) ? x_speed : y_speed;
+    axis_speed_supported = false;
     if (fallback_speed < MOTOR1_MIN_SPEED)
       fallback_speed = MOTOR1_MIN_SPEED;
     if (fallback_speed > MOTOR1_MAX_SPEED)
@@ -1634,6 +1642,164 @@ void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
   motor_ctl_unlock();
 }
 
+// --- continuous vector ('vector', WebSocket only) -------------------------
+//
+// See motor-ctl.h for why a stick deflection is not just a repeated 'move'.
+
+// Per-mille deflection below which the stick counts as centred. The browser
+// applies its own, larger dead zone; this one is only the backstop that keeps
+// a rounding artefact on the wire - a pointer one pixel off the ring's centre
+// - from asking for a nine-steps-per-second crawl that looks like a hung
+// camera.
+#define VECTOR_DEADZONE 40
+
+// Speed at the dead-zone edge, as a percentage of the full-deflection speed.
+// Starting the ramp at zero would waste most of the stick's throw: on a
+// 4050-step axis anything under about a tenth of speed_pan is not visibly
+// motion, so the first third of the travel would feel dead and the control
+// would only become usable near the rim.
+#define VECTOR_MIN_SPEED_PCT 12
+
+// Direction the stick currently commands. Its own lock rather than
+// command_lock, for the same reason motor_ctl_stop() takes no lock: releasing
+// the stick has to clear this even while a homing sweep holds command_lock
+// for half a minute.
+static pthread_mutex_t vector_lock = PTHREAD_MUTEX_INITIALIZER;
+static int vector_dir_x = 0;
+static int vector_dir_y = 0;
+
+static void vector_release(void) {
+  pthread_mutex_lock(&vector_lock);
+  vector_dir_x = 0;
+  vector_dir_y = 0;
+  pthread_mutex_unlock(&vector_lock);
+}
+
+static int vector_axis_speed(int deflection, int ref_speed) {
+  int mag = (deflection < 0) ? -deflection : deflection;
+  long long pct;
+
+  if (mag <= VECTOR_DEADZONE)
+    return 0;
+  if (mag > 1000)
+    mag = 1000;
+
+  pct = VECTOR_MIN_SPEED_PCT +
+        ((long long)(100 - VECTOR_MIN_SPEED_PCT) * (mag - VECTOR_DEADZONE)) /
+            (1000 - VECTOR_DEADZONE);
+
+  return (int)(((long long)ref_speed * pct) / 100);
+}
+
+bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
+                      int *speed_y_out) {
+  struct motor_message m;
+  int dir_x = (vx > VECTOR_DEADZONE) - (vx < -VECTOR_DEADZONE);
+  int dir_y = (vy > VECTOR_DEADZONE) - (vy < -VECTOR_DEADZONE);
+  int travel_x, travel_y, base, sx, sy, ex, ey;
+  bool direction_changed;
+
+  if (speed_x_out)
+    *speed_x_out = 0;
+  if (speed_y_out)
+    *speed_y_out = 0;
+
+  if (!dir_x && !dir_y) {
+    motor_ctl_stop();
+    return true;
+  }
+
+  motor_ctl_lock();
+  motor_status_get(&m);
+  // sanitize_requested_speed() rather than motor_ctl_resolve_speed(): the
+  // latter would write the scaled speed back to last_known_speed, so every
+  // partial-deflection update would lower the reference the NEXT update
+  // scales against and a held stick would ratchet itself to a standstill.
+  // Nothing about a stick position should change the daemon's default speed.
+  base = sanitize_requested_speed(ref_speed, last_known_speed);
+  travel_x = (m.x_max_steps > 0) ? (int)m.x_max_steps
+             : (g_cfg.loaded && g_cfg.pan.max_steps > 0) ? g_cfg.pan.max_steps
+                                                         : 0;
+  travel_y = (m.y_max_steps > 0)  ? (int)m.y_max_steps
+             : (g_cfg.loaded && g_cfg.tilt.max_steps > 0)
+                 ? g_cfg.tilt.max_steps
+                 : 0;
+  motor_ctl_unlock();
+
+  if ((dir_x && travel_x <= 0) || (dir_y && travel_y <= 0))
+    return false;
+
+  sx = dir_x ? vector_axis_speed(vx, base) : 0;
+  sy = dir_y ? vector_axis_speed(vy, base) : 0;
+  // An axis the stick is not asking to move inherits the other axis's speed
+  // instead of keeping 0. Not cosmetic: motor_set_axis_speed() falls back to
+  // the single-speed MOTOR_SPEED ioctl with min(x,y) on kernels without
+  // MOTOR_SPEED_AXIS, so a 0 here would clamp to MOTOR1_MIN_SPEED and crawl
+  // the axis that IS moving at one step per second.
+  if (!dir_x)
+    sx = sy;
+  if (!dir_y)
+    sy = sx;
+  // Without MOTOR_SPEED_AXIS - the case on the T31 kernels in this fleet,
+  // which log "MOTOR_SPEED_AXIS unsupported" once at startup -
+  // motor_set_axis_speed() collapses the pair to min(x, y). For a diagonal
+  // stick that is the wrong reduction: pushed hard right and a hair up, the
+  // pan would inherit the tilt's near-idle speed and crawl, which reads as a
+  // hung camera. Measured before this line existed: x=1000/y=250 ran BOTH
+  // axes at ~280 steps/s instead of pan at 900. The dominant axis is what the
+  // stick's magnitude means, so give both that speed and let the minor axis
+  // overshoot its share - a diagonal that is slightly too straight is a far
+  // smaller error than one that barely moves.
+  if (!axis_speed_supported && sx != sy)
+    sx = sy = (sx > sy) ? sx : sy;
+  if (sx < MOTOR1_MIN_SPEED)
+    sx = MOTOR1_MIN_SPEED;
+  if (sy < MOTOR1_MIN_SPEED)
+    sy = MOTOR1_MIN_SPEED;
+
+  pthread_mutex_lock(&vector_lock);
+  direction_changed = (dir_x != vector_dir_x || dir_y != vector_dir_y);
+  pthread_mutex_unlock(&vector_lock);
+
+  if (direction_changed) {
+    // motor_ctl_stop() first, and not only because reversing a stepper needs
+    // it: motor_steps() opens with wait_until_idle(5000), so issuing into a
+    // move that is still running would park the new worker for five seconds
+    // before the new direction reached the hardware.
+    motor_ctl_stop();
+    motor_ctl_relative(dir_x * travel_x, dir_y * travel_y,
+                       (sx > sy) ? sx : sy, NULL, NULL);
+    // No per-axis push on this call. dispatch_profiled_move() is
+    // asynchronous and its worker calls motor_set_axis_speed() itself, so a
+    // push from here would race it and lose. The next update applies the
+    // split, by which time the axis has moved a few dozen steps at the
+    // faster axis's speed.
+  } else {
+    // compute_axis_speeds() caps one requested speed against BOTH configured
+    // per-axis maxima and writes only the outputs it is given, so calling it
+    // twice caps each axis against its own without duplicating that rule.
+    ex = sx;
+    ey = sy;
+    compute_axis_speeds(sx, &ex, NULL);
+    compute_axis_speeds(sy, NULL, &ey);
+
+    motor_ctl_lock();
+    motor_set_axis_speed(ex, ey);
+    motor_ctl_unlock();
+  }
+
+  pthread_mutex_lock(&vector_lock);
+  vector_dir_x = dir_x;
+  vector_dir_y = dir_y;
+  pthread_mutex_unlock(&vector_lock);
+
+  if (speed_x_out)
+    *speed_x_out = dir_x ? sx : 0;
+  if (speed_y_out)
+    *speed_y_out = dir_y ? sy : 0;
+  return true;
+}
+
 void motor_ctl_absolute(int x, int got_x, int y, int got_y, int speed,
                         int *target_x_out, int *target_y_out) {
   struct motor_message motor_message;
@@ -1761,6 +1927,12 @@ void motor_ctl_cruise(void) {
 void motor_ctl_stop(void) {
   motion_cancel_all(true);
   remove_motion_active_flag();
+  // Releasing the stick has to go through here too, or the next gesture in
+  // the same direction would look like an unchanged vector and get a speed
+  // push against a move that no longer exists - a joystick that moves the
+  // camera once and then never again. vector_lock is separate from
+  // command_lock precisely so this stays as unblockable as the rest of stop.
+  vector_release();
 }
 
 void motor_ctl_home(int speed) {

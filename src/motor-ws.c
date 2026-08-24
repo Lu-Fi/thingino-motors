@@ -526,6 +526,45 @@ static int handle_command(ws_client *c, const char *text) {
     }
 
     rc = send_ack(c, id, "move", true, ax, ay);
+  } else if (strcmp(cmd, "vector") == 0) {
+    /* Analog-stick deflection, per-mille and signed, in the logical frame.
+     * NOT a distance: the client says where the stick is and the daemon
+     * decides both how far (always: to the limit) and how fast, so the page
+     * never has to know the travel limits or the configured speed cap. The
+     * optional `speed` validated above is the reference for FULL deflection,
+     * not the speed of this update.
+     *
+     * Out of range is clamped here, unlike `speed` which is rejected. The
+     * difference is deliberate: 1000 is a stick at the rim, so a client that
+     * computes 1004 from a pointer a pixel outside the ring has made a
+     * rounding error, not the kind of mistake worth surfacing that a
+     * speed=99999 is. */
+    long long xv = 0, yv = 0;
+    bool got_x = json_int(root, "x", &xv);
+    bool got_y = json_int(root, "y", &yv);
+    int sx = 0, sy = 0;
+
+    if (!got_x && !got_y) {
+      rc = send_error(c, id, "bad_request", "vector needs x and/or y");
+      goto out;
+    }
+
+    /* Clamp as long long: casting an out-of-range long long to int first
+     * would be the undefined step this is here to avoid. */
+    xv = (xv < -1000) ? -1000 : ((xv > 1000) ? 1000 : xv);
+    yv = (yv < -1000) ? -1000 : ((yv > 1000) ? 1000 : yv);
+
+    if (!motor_ctl_vector((int)xv, (int)yv, speed, &sx, &sy)) {
+      rc = send_error(c, id, "no_limits",
+                      "travel limits unknown, cannot drive a vector");
+      goto out;
+    }
+
+    /* x/y in this ack are the per-axis SPEEDS commanded, not a delta the way
+     * a move's ack reports one - a vector has no delta to report, and the
+     * speed is the only thing the client cannot predict (the daemon caps it
+     * against motors.speed_pan/speed_tilt). */
+    rc = send_ack(c, id, "vector", true, sx, sy);
   } else if (strcmp(cmd, "stop") == 0) {
     motor_ctl_stop();
     rc = send_ack(c, id, "stop", false, 0, 0);

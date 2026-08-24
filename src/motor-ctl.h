@@ -93,13 +93,48 @@ int motor_ctl_resolve_speed(int requested_speed);
 void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
                         int *applied_y);
 
+/* Continuous "analog stick" move. WebSocket only - the AF_UNIX protocol has
+ * no gesture that needs it.
+ *
+ * vx/vy are a signed per-mille DEFLECTION of a virtual joystick in the
+ * logical frame (-1000..1000), not a distance: how hard the stick is pushed
+ * on each axis. ref_speed is what full deflection should reach, sanitized
+ * like every other request's speed; 0 means the daemon's current default.
+ *
+ * Why this is not simply 'move' re-sent with a new speed every few frames.
+ * motor_steps() opens with wait_until_idle(5000), so a move issued while
+ * another is still running parks its worker for up to five seconds before
+ * anything happens, and start_profiled_move_async()'s generation handoff
+ * cancels the old profile without stopping the hardware, so each re-issue
+ * leaves another detached worker sitting in a wait it cannot finish. A held
+ * stick at 11 messages/s would do that for the whole gesture.
+ *
+ * So the deflection is split the way the hardware actually takes it. A
+ * DIRECTION change is rare (there are only eight, and reversing a stepper
+ * needs a stop regardless) and gets one full-travel move. A MAGNITUDE change
+ * is continuous and gets a bare MOTOR_SPEED_AXIS ioctl, which the driver
+ * applies to the move already in flight - verified on a T31/wuuk unit
+ * (2026-08-24): a 3500-step move issued at speed 120 was running at ~122
+ * steps/s, and `motors -s 900` mid-move took it to ~910 steps/s within one
+ * one-second sample, with no stutter and no restart.
+ *
+ * Returns false when the travel limits are unknown for an axis the stick is
+ * asking to move (x_max/y_max 0 and nothing configured): "go until the limit"
+ * has no meaning then, and nothing was issued. speed_x/speed_y, when
+ * non-NULL, receive the per-axis speeds actually commanded. */
+bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x,
+                      int *speed_y);
+
 /* Absolute move ('d'/'h'). x/y are logical; got_x/got_y say whether the
  * caller actually specified that axis (0 = keep the current position). The
  * resolved RAW targets are written to target_x/target_y when non-NULL. */
 void motor_ctl_absolute(int x, int got_x, int y, int got_y, int speed,
                         int *target_x, int *target_y);
 
-void motor_ctl_stop(void);   /* 'd'/'s' */
+/* 'd'/'s'. Also releases any stick direction held by motor_ctl_vector(), so
+ * the gesture after a stop always starts with a fresh move rather than a
+ * speed push against a move that is no longer running. */
+void motor_ctl_stop(void);
 void motor_ctl_goback(void); /* 'd'/'b' */
 void motor_ctl_cruise(void); /* 'd'/'c' */
 void motor_ctl_home(int speed); /* 'r' - SYNCHRONOUS, can take tens of seconds */
