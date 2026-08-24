@@ -1675,6 +1675,14 @@ static void vector_release(void) {
   pthread_mutex_unlock(&vector_lock);
 }
 
+// Exponent of the deflection-to-speed curve (see vector_axis_speed()).
+// 1.0 would be linear; smaller values push more of the speed range toward
+// the dead-zone edge, making small deflections near centre more sensitive
+// at the cost of the curve flattening out - and so reaching top speed -
+// earlier in the throw. 0.5 (square root) was the first cut; dropped
+// further after it still felt too linear close to centre.
+#define VECTOR_CURVE_EXP 0.35
+
 static int vector_axis_speed(int deflection, int ref_speed) {
   int mag = (deflection < 0) ? -deflection : deflection;
   double ratio, pct;
@@ -1685,13 +1693,14 @@ static int vector_axis_speed(int deflection, int ref_speed) {
     mag = 1000;
 
   ratio = (double)(mag - VECTOR_DEADZONE) / (double)(1000 - VECTOR_DEADZONE);
-  // Square-root rather than linear: the slope is steepest right at the
-  // dead-zone edge, so a small nudge out of centre already buys a real
-  // speed increase (more sensitive close in), and it flattens out toward
-  // full deflection, so the axis is essentially at full speed well before
-  // the stick reaches the rim (faster ramp-up toward the outside) instead
-  // of needing the very last bit of travel to get there.
-  ratio = sqrt(ratio);
+  // pow() rather than linear: the slope is steepest right at the dead-zone
+  // edge, so a small nudge out of centre already buys a real speed increase
+  // (more sensitive close in), and it flattens out toward full deflection,
+  // so the axis is essentially at full speed well before the stick reaches
+  // the rim (faster ramp-up toward the outside) instead of needing the very
+  // last bit of travel to get there. Both endpoints are unchanged either
+  // way: ratio 0 stays 0, ratio 1 stays 1.
+  ratio = pow(ratio, VECTOR_CURVE_EXP);
   pct = VECTOR_MIN_SPEED_PCT + (100 - VECTOR_MIN_SPEED_PCT) * ratio;
 
   return (int)(((double)ref_speed * pct) / 100.0);
