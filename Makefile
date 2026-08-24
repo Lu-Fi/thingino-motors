@@ -43,8 +43,30 @@ BINARIES := motor motor-daemon
 # The WebSocket frontend. ws.c/sha1.c/sha256.c are generic protocol+hash
 # code with no motors knowledge and no libjct dependency, which is what lets
 # the self-test below link them on their own.
+#
+# WS=0 builds the daemon without any of it - no listener, no token store,
+# ~25 KB less text. That configuration is not hypothetical: the thingino
+# package that consumes this tree gates the same five files behind a Kconfig
+# option (BR2_PACKAGE_THINGINO_MOTORS_WS) and compiles the .c files directly
+# instead of calling this Makefile, so it has to be buildable here as well or
+# nobody notices when an unguarded reference breaks it. -DMOTORS_WS is what
+# motor-daemon.c keys its #ifdefs off; both builds must stay warning-clean.
+# WS_DEFS is kept out of CFLAGS on purpose. CFLAGS is declared with ?= so a
+# caller can replace it wholesale (`make CFLAGS="-Wall -Os"`), and a
+# command-line assignment overrides every += in this file - which would have
+# silently dropped -DMOTORS_WS and produced a daemon that links the whole
+# listener and then never starts it. Appending it at the compile rule instead
+# makes that impossible.
+WS       ?= 1
+
+ifeq ($(WS),0)
+WS_OBJS  :=
+WS_DEFS  :=
+else
 WS_OBJS  := $(SRC_DIR)/sha1.o $(SRC_DIR)/sha256.o $(SRC_DIR)/ws.o \
             $(SRC_DIR)/ws_token.o $(SRC_DIR)/motor-ws.o
+WS_DEFS  := -DMOTORS_WS
+endif
 
 OBJS     := $(SRC_DIR)/motor.o $(SRC_DIR)/motor-daemon.o $(WS_OBJS)
 
@@ -88,7 +110,7 @@ check: selftest
 	./$(TEST_DIR)/ws_selftest
 
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
-	$(CC) $(CFLAGS) $(INCLUDE_DIRS) -c -o $@ $<
+	$(CC) $(CFLAGS) $(WS_DEFS) $(INCLUDE_DIRS) -c -o $@ $<
 
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \

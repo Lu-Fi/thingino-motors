@@ -20,7 +20,23 @@
 #include <sys/un.h>
 
 #include "motor-ctl.h"
+/* The WebSocket frontend is optional at compile time.
+ *
+ * It is a build-time switch and not just a runtime one because the packaging
+ * that consumes this tree compiles a chosen list of .c files directly rather
+ * than running this repo's Makefile - thingino's package/thingino-motors has
+ * a Kconfig option (BR2_PACKAGE_THINGINO_MOTORS_WS) that decides whether
+ * sha1/sha256/ws/ws_token/motor-ws are in the link at all, and passes
+ * -DMOTORS_WS when they are. Without this guard, an unselected build fails to
+ * link on motor_ws_start(), which is what happens today; with it, a camera
+ * that does not want the listener does not carry ~25 KB of protocol code it
+ * can never reach.
+ *
+ * This repo's own Makefile always builds the full set and defines MOTORS_WS;
+ * `make WS=0` reproduces the lean configuration. */
+#ifdef MOTORS_WS
 #include "motor-ws.h"
+#endif
 
 // Configuration structures
 #define MOTOR_GPIO_STR_LEN 64
@@ -551,6 +567,7 @@ static bool load_config_file(void) {
 // structurally impossible for "motors -R" to half-apply a listener setting.
 // A ws_* change needs a daemon restart, and that is now a property of the
 // code rather than a note in a README.
+#ifdef MOTORS_WS
 static void load_ws_config_file(motor_ws_cfg *cfg) {
   JsonValue *root;
   JsonValue *motors;
@@ -607,6 +624,7 @@ static void load_ws_config_file(motor_ws_cfg *cfg) {
   // hashes and wipes.
   free_json_value(root);
 }
+#endif /* MOTORS_WS */
 
 #define SV_SOCK_PATH "/dev/md"
 #define MAX_CONN 5
@@ -2173,6 +2191,7 @@ int main(int argc, char *argv[]) {
   // completely undisturbed; a failure to bind is logged and ignored, because
   // a camera that cannot open a TCP port must still be drivable by the CLI
   // over /dev/md.
+#ifdef MOTORS_WS
   {
     motor_ws_cfg ws_cfg;
     load_ws_config_file(&ws_cfg);
@@ -2187,6 +2206,7 @@ int main(int argc, char *argv[]) {
     // copy is clean on the path where the listener never started.
     memset(&ws_cfg, 0, sizeof(ws_cfg));
   }
+#endif /* MOTORS_WS */
 
   syslog(LOG_INFO, "motors-daemon started");
 
