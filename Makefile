@@ -37,10 +37,17 @@ endif
 LIBS += -ljct
 
 SRC_DIR  := src
+TEST_DIR := tests
 BINARIES := motor motor-daemon
-OBJS     := $(SRC_DIR)/motor.o $(SRC_DIR)/motor-daemon.o
 
-.PHONY: all deps clean distclean format
+# ws.c/sha1.c/sha256.c are generic protocol+hash code with no motors
+# knowledge and no libjct dependency, which is what lets the self-test below
+# link them on their own.
+OBJS     := $(SRC_DIR)/motor.o $(SRC_DIR)/motor-daemon.o \
+            $(SRC_DIR)/sha1.o $(SRC_DIR)/sha256.o $(SRC_DIR)/ws.o \
+            $(TEST_DIR)/ws_selftest.o
+
+.PHONY: all deps clean distclean format selftest check
 
 all: deps $(BINARIES)
 
@@ -53,19 +60,35 @@ motor: $(SRC_DIR)/motor.o | deps
 motor-daemon: $(SRC_DIR)/motor-daemon.o | deps
 	$(CC) $(CFLAGS) -o $@ $^ $(LIB_DIRS) $(LIBS) $(LDFLAGS)
 
+# Self-test for the parts that can be exercised without a motor: SHA-1,
+# SHA-256, base64, the RFC 6455 Sec-WebSocket-Accept vector, frame
+# encode/parse and the query-string parser. Links no libjct and no motor
+# code, so it builds and runs natively on the development host even though
+# the daemon itself only builds against the target sysroot.
+selftest: $(TEST_DIR)/ws_selftest
+$(TEST_DIR)/ws_selftest: $(TEST_DIR)/ws_selftest.o $(SRC_DIR)/sha1.o \
+                         $(SRC_DIR)/sha256.o $(SRC_DIR)/ws.o
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+check: selftest
+	./$(TEST_DIR)/ws_selftest
+
+$(TEST_DIR)/%.o: $(TEST_DIR)/%.c
+	$(CC) $(CFLAGS) -I$(SRC_DIR) $(INCLUDE_DIRS) -c -o $@ $<
+
 $(SRC_DIR)/%.o: $(SRC_DIR)/%.c
 	$(CC) $(CFLAGS) $(INCLUDE_DIRS) -c -o $@ $<
 
 format:
 	@if command -v clang-format >/dev/null 2>&1; then \
-		clang-format -i $(SRC_DIR)/motor.c $(SRC_DIR)/motor-daemon.c; \
+		clang-format -i $(SRC_DIR)/*.c $(SRC_DIR)/*.h; \
 	else \
 		echo "clang-format not found; skipping format"; \
 	fi
 
 clean:
-	rm -f $(OBJS) $(BINARIES)
-	rm -f *.o *.a *.so $(SRC_DIR)/*.o
+	rm -f $(OBJS) $(BINARIES) $(TEST_DIR)/ws_selftest
+	rm -f *.o *.a *.so $(SRC_DIR)/*.o $(TEST_DIR)/*.o
 
 distclean: clean
 	rm -rf third_party
