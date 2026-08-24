@@ -422,6 +422,42 @@ static bool parse_legacy_layout(JsonValue *root) {
   return parsed;
 }
 
+// The streamer's image flips (image.vflip / image.hflip in the streamer
+// config) mirror the displayed picture, so the same head motion reads as the
+// opposite screen direction on a flipped camera. XOR them into the inversion
+// state right after the config's own invert_x/invert_y (load_config_file()
+// zeroes the state first, so both XOR sets compose idempotently on every
+// (re)load):
+//
+//   net_x = invert_x XOR hflip
+//   net_y = invert_y XOR vflip
+//
+// The logical frame is thereby defined by what is on screen, and a camera
+// mounted upside-down with vflip/hflip set in the streamer needs no hand-
+// tuned invert_* for the mount. Missing config / keys mean "no flips".
+// A flip change requires a reload ('R' IPC / S59motor reload) or restart to
+// take effect, exactly like invert_x/invert_y.
+static void apply_flip_inversion(void) {
+  JsonValue *root = parse_json_file("/etc/prudynt.json");
+  if (!root)
+    return;
+  if (root->type != JSON_OBJECT) {
+    free_json_value(root);
+    return;
+  }
+
+  JsonValue *image = get_object_item(root, "image");
+  if (image && image->type == JSON_OBJECT) {
+    bool hflip = false, vflip = false;
+    if (json_get_bool_jct(image, "hflip", &hflip) && hflip)
+      motor_inversion_state ^= MOTOR_INVERT_X;
+    if (json_get_bool_jct(image, "vflip", &vflip) && vflip)
+      motor_inversion_state ^= MOTOR_INVERT_Y;
+  }
+
+  free_json_value(root);
+}
+
 // Returns true if /etc/thingino.json was found, was a JSON object, and got
 // parsed into g_cfg (even if some individual keys were missing and defaults
 // were used for those); false if the file is missing, unreadable, or not a
@@ -455,6 +491,10 @@ static bool load_config_file(void) {
 
   if (!parsed)
     parsed = parse_legacy_layout(root);
+
+  // Flip the logical frame with the displayed image before the home
+  // mirroring below picks the net inversion up.
+  apply_flip_inversion();
 
   if (parsed) {
     sanitize_axis_cfg(&g_cfg.pan);
