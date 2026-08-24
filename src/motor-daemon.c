@@ -308,7 +308,9 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
     parsed = true;
   }
   // Apply config-time axis inversion (invert_x / invert_y from thingino.json).
-  // These XOR into motor_inversion_state so runtime IPC toggles still work.
+  // load_config_file() zeroes motor_inversion_state before calling here, so
+  // these XORs act as an idempotent set; runtime "motors -I" IPC toggles then
+  // XOR on top until the next reload/restart.
   bool invert_x = false, invert_y = false;
   if (json_get_bool_jct(motors, "invert_x", &invert_x)) {
     if (invert_x)
@@ -420,18 +422,30 @@ static bool parse_legacy_layout(JsonValue *root) {
   return parsed;
 }
 
-static void load_config_file(void) {
+// Returns true if /etc/thingino.json was found, was a JSON object, and got
+// parsed into g_cfg (even if some individual keys were missing and defaults
+// were used for those); false if the file is missing, unreadable, or not a
+// JSON object at the root, in which case g_cfg is left at reset_config_defaults()
+// and callers must not treat the (re)load as having taken effect.
+static bool load_config_file(void) {
   JsonValue *root = parse_json_file("/etc/thingino.json");
   reset_config_defaults();
+  // The config file is authoritative for axis inversion on every (re)load.
+  // parse_modern_layout() XORs invert_x/invert_y into this state, so it must
+  // start from a known zero: without this reset, a reload ('R' command) with
+  // an unchanged file would toggle inversion straight back OFF. This also
+  // discards any runtime "motors -I" toggles, exactly as a daemon restart
+  // always has.
+  motor_inversion_state = MOTOR_NO_INVERSION;
   if (!root) {
     syslog(LOG_DEBUG, "No config file found; using defaults");
-    return;
+    return false;
   }
 
   if (root->type != JSON_OBJECT) {
     syslog(LOG_DEBUG, "Config file root is not a JSON object; ignoring");
     free_json_value(root);
-    return;
+    return false;
   }
 
   bool parsed = false;
@@ -460,6 +474,7 @@ static void load_config_file(void) {
   }
 
   free_json_value(root);
+  return true;
 }
 
 #define SV_SOCK_PATH "/dev/md"
@@ -492,11 +507,17 @@ static void load_config_file(void) {
 enum motor_status {
   MOTOR_IS_STOP,
   MOTOR_IS_RUNNING,
+  // Only ever sent as the status field of the 'R' (reload) ack, never
+  // produced by MOTOR_GET_STATUS. Lets "motors -R" tell a failed reload
+  // (config missing/invalid, defaults now in effect) apart from a normal
+  // idle/running status without changing the wire format for any other
+  // command. Keep this enum's values identical to the copy in motor.c.
+  MOTOR_RELOAD_FAILED,
 };
 
 struct request {
-  char command; // d,r,s,p,b,S,i,j (move, reset,set speed,get position, is
-                // busy,Status,initial,JSON)
+  char command; // d,r,s,p,b,S,i,j,R (move, reset,set speed,get position, is
+                // busy,Status,initial,JSON,Reload config)
   char type;    // g,h,c,s (absolute,relative,cruise,stop)
   int x;
   int got_x;
@@ -569,6 +590,21 @@ static void write_motion_active_flag(void);
 static void remove_motion_active_flag(void);
 static int get_motion_timeout_ms(void);
 static void physical_delta_to_steps(int *dx, int *dy);
+
+// Derive the default speed from the loaded config. Shared between startup
+// and the 'R' (reload) IPC command so both apply identical semantics.
+static void apply_config_speed_default(void) {
+  if (!g_cfg.loaded)
+    return;
+
+  int cfg_speed = 0;
+  if (g_cfg.pan.speed > 0)
+    cfg_speed = g_cfg.pan.speed;
+  if (g_cfg.tilt.speed > 0 && g_cfg.tilt.speed > cfg_speed)
+    cfg_speed = g_cfg.tilt.speed;
+  if (cfg_speed > 0)
+    last_known_speed = cfg_speed;
+}
 
 static int sanitize_requested_speed(int requested, int fallback) {
   int speed = (requested > 0) ? requested : fallback;
@@ -1437,17 +1473,12 @@ int main(int argc, char *argv[]) {
   debug_mode = debug_requested;
   configure_logmask();
 
-  // Load configuration early
-  load_config_file();
-  if (g_cfg.loaded) {
-    int cfg_speed = 0;
-    if (g_cfg.pan.speed > 0)
-      cfg_speed = g_cfg.pan.speed;
-    if (g_cfg.tilt.speed > 0 && g_cfg.tilt.speed > cfg_speed)
-      cfg_speed = g_cfg.tilt.speed;
-    if (cfg_speed > 0)
-      last_known_speed = cfg_speed;
-  }
+  // Load configuration early. A missing/invalid config file is not fatal
+  // here (defaults apply and load_config_file() already logs the specific
+  // reason at LOG_DEBUG) - matches the pre-existing behavior of this call
+  // site, which never checked for failure either.
+  (void)load_config_file();
+  apply_config_speed_default();
 
   while ((c = getopt(argc, argv, "dhpD")) != -1) {
     switch (c) {
@@ -1855,6 +1886,86 @@ int main(int argc, char *argv[]) {
         default:
           syslog(LOG_DEBUG, "Invalid inversion command type.");
           break;
+        }
+        break;
+      case 'R': // reload userspace config from /etc/thingino.json
+        // Lets invert_x/invert_y (and speeds, accel, timeouts, pos_0) take
+        // effect without restarting this process and, critically, without
+        // the modprobe -r/modprobe cycle in "S59motor restart" that has
+        // oopsed live kernels. The kernel module is never touched here:
+        // no ioctl is issued beyond the ordinary status read for the ack,
+        // and the position counter lives in the driver, so tracking is
+        // preserved across the reload.
+        //
+        // The async move workers read g_cfg without locking (established
+        // behavior throughout this file), so cancel any in-flight profiled
+        // move and let it wind down before rewriting the config under it.
+        motion_cancel_all(true);
+        remove_motion_active_flag();
+        if (wait_until_idle(2000, 20) != 0)
+          syslog(LOG_WARNING,
+                 "motors -R: motors still moving after 2s wait; reloading "
+                 "config anyway");
+        usleep(50 * 1000); // let cancelled workers pass their final checks
+
+        {
+          bool reload_ok = load_config_file();
+          apply_config_speed_default();
+
+          if (!reload_ok) {
+            // load_config_file() already reset g_cfg to defaults (see its
+            // own early-return logging above for the specific reason), so
+            // g_cfg.loaded is now false: max-step overrides and position
+            // clamping in motor_status_get() are gone until the next
+            // successful load. Do not ack success.
+            syslog(LOG_WARNING,
+                   "motors -R: reload FAILED (/etc/thingino.json missing, "
+                   "unreadable, or not a JSON object); config reset to "
+                   "defaults, previous settings are NOT in effect");
+          } else {
+            syslog(LOG_INFO,
+                   "Config reloaded from /etc/thingino.json (inversion=0x%x, "
+                   "default speed=%d)",
+                   (unsigned int)motor_inversion_state, last_known_speed);
+
+            // steps_pan/steps_tilt are real kernel module parameters
+            // (hmaxstep/vmaxstep); seed_driver_limits_from_config() only
+            // ever (re)programs them once at startup (limits_seeded), and
+            // deliberately not here, because doing so needs MOTOR_RESET,
+            // which would destroy the position tracking this reload path
+            // exists to preserve. If the freshly loaded config now disagrees
+            // with what the kernel actually has loaded, userspace's
+            // clamping/mirroring math (motor_status_get(),
+            // motor_status_get_logical(), motor_x_to_raw()) silently
+            // desyncs from kernel-enforced limits. Warn loudly; do not
+            // try to auto-fix it here.
+            unsigned int kernel_max_x = 0, kernel_max_y = 0;
+            motor_get_maxsteps_sysfs(&kernel_max_x, &kernel_max_y);
+            bool pan_mismatch = kernel_max_x > 0 && g_cfg.pan.max_steps > 0 &&
+                                kernel_max_x != (unsigned int)g_cfg.pan.max_steps;
+            bool tilt_mismatch = kernel_max_y > 0 && g_cfg.tilt.max_steps > 0 &&
+                                 kernel_max_y != (unsigned int)g_cfg.tilt.max_steps;
+            if (pan_mismatch || tilt_mismatch) {
+              syslog(LOG_WARNING,
+                     "motors -R: reloaded steps_pan/steps_tilt (%d/%d) "
+                     "differ from the kernel's already-loaded limits "
+                     "(hmaxstep=%u, vmaxstep=%u); a full restart (S59motor "
+                     "restart / reboot) is required for the new step "
+                     "limits to take effect at the kernel level",
+                     g_cfg.pan.max_steps, g_cfg.tilt.max_steps, kernel_max_x,
+                     kernel_max_y);
+            }
+          }
+
+          // Ack with fresh logical status so "motors -R" callers can verify
+          // the new inversion state took effect. Note: keys that are kernel
+          // module parameters (gpio pins, hmaxstep/vmaxstep) are re-read
+          // into g_cfg but cannot reprogram the loaded module; they still
+          // need a full stop/start of S59motor.
+          motor_status_get_logical(&motor_message);
+          if (!reload_ok)
+            motor_message.status = MOTOR_RELOAD_FAILED;
+          write(clientfd, &motor_message, sizeof(struct motor_message));
         }
         break;
       case 'S': // show status
