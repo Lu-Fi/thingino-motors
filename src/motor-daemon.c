@@ -455,11 +455,12 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
     // Below ~0.05 the curve is nearly a step function (any deflection past
     // the dead zone reads as ~full speed), and pow() of a ratio that can be
     // exactly 0.0 by a negative-ish exponent is undefined territory best
-    // avoided rather than merely clamped after the fact. Above 1.0 the curve
-    // stops being more sensitive than linear, which defeats the point of the
-    // setting - so this is the field's whole usable range, not just a sanity
-    // floor/ceiling.
-    if (curve_exp < 0.05 || curve_exp > 1.0)
+    // avoided rather than merely clamped after the fact. 1.0 is linear;
+    // above it the curve inverts - centre gets LESS sensitive than linear,
+    // for finer close-up framing, ramping up only near the rim - which is
+    // as legitimate a preference as the opposite, so the range extends to
+    // 2.0 rather than treating 1.0 as a ceiling.
+    if (curve_exp < 0.05 || curve_exp > 2.0)
       curve_exp = VECTOR_CURVE_EXP_DEFAULT;
     g_cfg.joystick_curve_exp = curve_exp;
     parsed = true;
@@ -1729,10 +1730,12 @@ static void vector_release(void) {
   pthread_mutex_unlock(&vector_lock);
 }
 
-// Exponent of the deflection-to-speed curve. 1.0 would be linear; smaller
-// values push more of the speed range toward the dead-zone edge, making
-// small deflections near centre more sensitive at the cost of the curve
-// flattening out - and so reaching top speed - earlier in the throw.
+// Exponent of the deflection-to-speed curve. 1.0 is linear; below it, more
+// of the speed range moves toward the dead-zone edge, making small
+// deflections near centre more sensitive at the cost of the curve
+// flattening out - and so reaching top speed - earlier in the throw. Above
+// 1.0 the curve inverts: centre gets LESS sensitive than linear (finer
+// close-up framing), with the ramp-up saved for near the rim instead.
 // User-configurable as motors.joystick_sensitivity in /etc/thingino.json
 // (g_cfg.joystick_curve_exp, parsed and range-checked in
 // parse_modern_layout()); VECTOR_CURVE_EXP_DEFAULT is only the fallback
