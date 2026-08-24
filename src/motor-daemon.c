@@ -68,15 +68,9 @@ typedef struct {
   AxisCfg tilt; // Y axis
   MotorHwCfg hw;
   bool loaded; // whether configuration was loaded
-  // Exponent of the joystick vector-speed curve; see vector_axis_speed()
-  // and VECTOR_CURVE_EXP_DEFAULT below.
-  double joystick_curve_exp;
+  double joystick_curve_exp; // see vector_axis_speed()
 } MotorConfig;
 
-// Default/fallback for MotorConfig.joystick_curve_exp - see
-// vector_axis_speed() for what the exponent actually does. Also the value
-// reset_config_defaults() and load_config_file()'s out-of-range clamp fall
-// back to.
 #define VECTOR_CURVE_EXP_DEFAULT 0.25
 
 static MotorConfig g_cfg = {
@@ -452,14 +446,7 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
 
   double curve_exp;
   if (json_get_double_jct(motors, "joystick_sensitivity", &curve_exp)) {
-    // Below ~0.05 the curve is nearly a step function (any deflection past
-    // the dead zone reads as ~full speed), and pow() of a ratio that can be
-    // exactly 0.0 by a negative-ish exponent is undefined territory best
-    // avoided rather than merely clamped after the fact. 1.0 is linear;
-    // above it the curve inverts - centre gets LESS sensitive than linear,
-    // for finer close-up framing, ramping up only near the rim - which is
-    // as legitimate a preference as the opposite, so the range extends to
-    // 2.0 rather than treating 1.0 as a ceiling.
+    // Valid range 0.05..2.0; see vector_axis_speed().
     if (curve_exp < 0.05 || curve_exp > 2.0)
       curve_exp = VECTOR_CURVE_EXP_DEFAULT;
     g_cfg.joystick_curve_exp = curve_exp;
@@ -1701,24 +1688,13 @@ void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
 //
 // See motor-ctl.h for why a stick deflection is not just a repeated 'move'.
 
-// Per-mille deflection below which the stick counts as centred. The browser
-// applies its own, larger dead zone; this one is only the backstop that keeps
-// a rounding artefact on the wire - a pointer one pixel off the ring's centre
-// - from asking for a nine-steps-per-second crawl that looks like a hung
-// camera.
+// Backstop dead zone (per-mille); the browser's own is larger.
 #define VECTOR_DEADZONE 40
 
-// Speed at the dead-zone edge, as a percentage of the full-deflection speed.
-// Starting the ramp at zero would waste most of the stick's throw: on a
-// 4050-step axis anything under about a tenth of speed_pan is not visibly
-// motion, so the first third of the travel would feel dead and the control
-// would only become usable near the rim.
+// Speed at the dead-zone edge, as % of full-deflection speed.
 #define VECTOR_MIN_SPEED_PCT 12
 
-// Direction the stick currently commands. Its own lock rather than
-// command_lock, for the same reason motor_ctl_stop() takes no lock: releasing
-// the stick has to clear this even while a homing sweep holds command_lock
-// for half a minute.
+// Own lock, not command_lock: must clear even mid-homing-sweep.
 static pthread_mutex_t vector_lock = PTHREAD_MUTEX_INITIALIZER;
 static int vector_dir_x = 0;
 static int vector_dir_y = 0;
@@ -1730,19 +1706,11 @@ static void vector_release(void) {
   pthread_mutex_unlock(&vector_lock);
 }
 
-// Exponent of the deflection-to-speed curve. 1.0 is linear; below it, more
-// of the speed range moves toward the dead-zone edge, making small
-// deflections near centre more sensitive at the cost of the curve
-// flattening out - and so reaching top speed - earlier in the throw. Above
-// 1.0 the curve inverts: centre gets LESS sensitive than linear (finer
-// close-up framing), with the ramp-up saved for near the rim instead.
-// User-configurable as motors.joystick_sensitivity in /etc/thingino.json
-// (g_cfg.joystick_curve_exp, parsed and range-checked in
-// parse_modern_layout()); VECTOR_CURVE_EXP_DEFAULT is only the fallback
-// for a missing/invalid value. Settled here at 0.25 after starting at 0.5
-// (square root) and 0.35, both of which still felt too linear close to
-// centre - but taste in this is exactly why it is a config value now
-// rather than a rebuild.
+// Deflection-to-speed curve exponent (1.0 = linear; below = more
+// sensitive near centre; above = less). User-configurable via
+// motors.joystick_sensitivity (g_cfg.joystick_curve_exp); see
+// parse_modern_layout() for range-checking, VECTOR_CURVE_EXP_DEFAULT
+// below for the fallback.
 static int vector_axis_speed(int deflection, int ref_speed) {
   int mag = (deflection < 0) ? -deflection : deflection;
   double ratio, pct;
@@ -1753,13 +1721,7 @@ static int vector_axis_speed(int deflection, int ref_speed) {
     mag = 1000;
 
   ratio = (double)(mag - VECTOR_DEADZONE) / (double)(1000 - VECTOR_DEADZONE);
-  // pow() rather than linear: the slope is steepest right at the dead-zone
-  // edge, so a small nudge out of centre already buys a real speed increase
-  // (more sensitive close in), and it flattens out toward full deflection,
-  // so the axis is essentially at full speed well before the stick reaches
-  // the rim (faster ramp-up toward the outside) instead of needing the very
-  // last bit of travel to get there. Both endpoints are unchanged either
-  // way: ratio 0 stays 0, ratio 1 stays 1.
+  // Endpoints fixed: ratio 0 stays 0, ratio 1 stays 1.
   ratio = pow(ratio, g_cfg.joystick_curve_exp);
   pct = VECTOR_MIN_SPEED_PCT + (100 - VECTOR_MIN_SPEED_PCT) * ratio;
 
