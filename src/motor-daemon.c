@@ -1679,9 +1679,9 @@ static void vector_release(void) {
 // 1.0 would be linear; smaller values push more of the speed range toward
 // the dead-zone edge, making small deflections near centre more sensitive
 // at the cost of the curve flattening out - and so reaching top speed -
-// earlier in the throw. 0.5 (square root) was the first cut; dropped
-// further after it still felt too linear close to centre.
-#define VECTOR_CURVE_EXP 0.35
+// earlier in the throw. Started at 0.5 (square root), then 0.35 - both
+// still felt too linear close to centre.
+#define VECTOR_CURVE_EXP 0.25
 
 static int vector_axis_speed(int deflection, int ref_speed) {
   int mag = (deflection < 0) ? -deflection : deflection;
