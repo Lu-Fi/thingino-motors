@@ -1677,18 +1677,24 @@ static void vector_release(void) {
 
 static int vector_axis_speed(int deflection, int ref_speed) {
   int mag = (deflection < 0) ? -deflection : deflection;
-  long long pct;
+  double ratio, pct;
 
   if (mag <= VECTOR_DEADZONE)
     return 0;
   if (mag > 1000)
     mag = 1000;
 
-  pct = VECTOR_MIN_SPEED_PCT +
-        ((long long)(100 - VECTOR_MIN_SPEED_PCT) * (mag - VECTOR_DEADZONE)) /
-            (1000 - VECTOR_DEADZONE);
+  ratio = (double)(mag - VECTOR_DEADZONE) / (double)(1000 - VECTOR_DEADZONE);
+  // Square-root rather than linear: the slope is steepest right at the
+  // dead-zone edge, so a small nudge out of centre already buys a real
+  // speed increase (more sensitive close in), and it flattens out toward
+  // full deflection, so the axis is essentially at full speed well before
+  // the stick reaches the rim (faster ramp-up toward the outside) instead
+  // of needing the very last bit of travel to get there.
+  ratio = sqrt(ratio);
+  pct = VECTOR_MIN_SPEED_PCT + (100 - VECTOR_MIN_SPEED_PCT) * ratio;
 
-  return (int)(((long long)ref_speed * pct) / 100);
+  return (int)(((double)ref_speed * pct) / 100.0);
 }
 
 bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
