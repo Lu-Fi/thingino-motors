@@ -105,8 +105,20 @@ void motor_ctl_cruise(void); /* 'd'/'c' */
 void motor_ctl_home(int speed); /* 'r' - SYNCHRONOUS, can take tens of seconds */
 
 /* Status in the logical frame, ready to hand back to a caller as an absolute
- * target. */
+ * target. Blocks on the command lock. */
 void motor_ctl_status(struct motor_message *out);
+
+/* Non-blocking status read: returns false and leaves *out untouched if a
+ * command is currently in a handler.
+ *
+ * The WebSocket status-push loop uses this rather than motor_ctl_status().
+ * A push is a periodic nicety - missing one costs a client one stale frame -
+ * whereas blocking on it would park the connection thread for the duration
+ * of whatever is holding the lock. During a homing sweep that is tens of
+ * seconds during which the client could not send anything, including the
+ * stop it probably wants. Skipping the sample is strictly better than
+ * freezing the socket. */
+bool motor_ctl_status_try(struct motor_message *out);
 
 void motor_ctl_set_speed(int speed); /* 's' */
 void motor_ctl_invert(char axis);    /* 'I', axis in {'x','y','b'} */

@@ -20,6 +20,7 @@
 #include <sys/un.h>
 
 #include "motor-ctl.h"
+#include "motor-ws.h"
 
 // Configuration structures
 #define MOTOR_GPIO_STR_LEN 64
@@ -536,6 +537,75 @@ static bool load_config_file(void) {
 
   free_json_value(root);
   return true;
+}
+
+// WebSocket listener settings, read from the same /etc/thingino.json "motors"
+// object as everything else and with the same json_get_*_jct() helpers, but
+// deliberately on its own pass rather than inside parse_modern_layout():
+//
+// these keys configure a socket that is bound exactly once, at startup. If
+// they rode along with the rest of the config they would also be re-read by
+// the 'R' reload path, where a changed ws_port or ws_token could not possibly
+// take effect - leaving g_cfg claiming one thing while the listener does
+// another. Keeping the pass separate and calling it only from main() makes it
+// structurally impossible for "motors -R" to half-apply a listener setting.
+// A ws_* change needs a daemon restart, and that is now a property of the
+// code rather than a note in a README.
+static void load_ws_config_file(motor_ws_cfg *cfg) {
+  JsonValue *root;
+  JsonValue *motors;
+  const char *s;
+  bool b = false;
+
+  motor_ws_cfg_defaults(cfg);
+
+  root = parse_json_file("/etc/thingino.json");
+  if (!root)
+    return;
+  if (root->type != JSON_OBJECT) {
+    free_json_value(root);
+    return;
+  }
+
+  motors = get_object_item(root, "motors");
+  if (motors && motors->type == JSON_OBJECT) {
+    if (json_get_bool_jct(motors, "ws_enabled", &b))
+      cfg->enabled = b;
+
+    (void)json_get_int_jct(motors, "ws_port", &cfg->port);
+    (void)json_get_int_jct(motors, "ws_max_clients", &cfg->max_clients);
+    (void)json_get_int_jct(motors, "ws_rate_limit", &cfg->rate_limit);
+    (void)json_get_int_jct(motors, "ws_push_ms", &cfg->push_ms);
+
+    s = json_get_string_jct(motors, "ws_bind");
+    if (s) {
+      strncpy(cfg->bind_addr, s, sizeof(cfg->bind_addr) - 1);
+      cfg->bind_addr[sizeof(cfg->bind_addr) - 1] = '\0';
+    }
+
+    s = json_get_string_jct(motors, "ws_token");
+    if (s) {
+      strncpy(cfg->token, s, sizeof(cfg->token) - 1);
+      cfg->token[sizeof(cfg->token) - 1] = '\0';
+    }
+
+    s = json_get_string_jct(motors, "ws_token_file");
+    if (s) {
+      strncpy(cfg->token_file, s, sizeof(cfg->token_file) - 1);
+      cfg->token_file[sizeof(cfg->token_file) - 1] = '\0';
+    }
+
+    s = json_get_string_jct(motors, "ws_origins");
+    if (s) {
+      strncpy(cfg->origins, s, sizeof(cfg->origins) - 1);
+      cfg->origins[sizeof(cfg->origins) - 1] = '\0';
+    }
+  }
+
+  // free_json_value() frees the string that cfg->token was copied out of, so
+  // the plaintext secret now exists only in cfg - which motor_ws_start()
+  // hashes and wipes.
+  free_json_value(root);
 }
 
 #define SV_SOCK_PATH "/dev/md"
@@ -1595,11 +1665,26 @@ void motor_ctl_cruise(void) {
   motor_ctl_unlock();
 }
 
+// Stop is the ONE handler that deliberately does not take the command lock.
+//
+// A PTZ stop has to reach the hardware immediately or it is not a stop. Held
+// behind the mutex it would be unreachable for the whole duration of a homing
+// sweep (up to ~35s) - precisely the situation in which a user reaches for
+// it. Both things it touches are already safe to call concurrently:
+// motion_cancel_all() has its own motion_lock and then issues MOTOR_STOP, and
+// remove_motion_active_flag() is a bare unlink().
+//
+// This changes nothing on the AF_UNIX path, which is still serial and can
+// never overlap anything. Caveat on the WS path, where it now CAN overlap:
+// enhanced_homing_daemon() predates any notion of cancellation - it drives
+// motor_steps() directly rather than through the generation-checked
+// run_profiled_move() - so a stop issued mid-home halts the motors but leaves
+// the remaining homing phases to run against a sweep that no longer matches
+// reality. Teaching homing to cancel means changing hard-won motion code and
+// is deliberately out of scope here.
 void motor_ctl_stop(void) {
-  motor_ctl_lock();
   motion_cancel_all(true);
   remove_motion_active_flag();
-  motor_ctl_unlock();
 }
 
 void motor_ctl_home(int speed) {
@@ -1623,6 +1708,14 @@ void motor_ctl_status(struct motor_message *out) {
   motor_ctl_lock();
   motor_status_get_logical(out);
   motor_ctl_unlock();
+}
+
+bool motor_ctl_status_try(struct motor_message *out) {
+  if (!motor_ctl_trylock())
+    return false;
+  motor_status_get_logical(out);
+  motor_ctl_unlock();
+  return true;
 }
 
 void motor_ctl_set_speed(int speed) {
@@ -2015,6 +2108,26 @@ int main(int argc, char *argv[]) {
   if (listen(serverfd, MAX_CONN) == -1) {
     closelog();
     exit(EXIT_FAILURE);
+  }
+
+  // Bring the WebSocket frontend up before entering the AF_UNIX accept loop.
+  // It owns its own listening socket and its own thread, so the loop below is
+  // completely undisturbed; a failure to bind is logged and ignored, because
+  // a camera that cannot open a TCP port must still be drivable by the CLI
+  // over /dev/md.
+  {
+    motor_ws_cfg ws_cfg;
+    load_ws_config_file(&ws_cfg);
+    if (ws_cfg.enabled) {
+      if (motor_ws_start(&ws_cfg) != 0)
+        syslog(LOG_WARNING, "WebSocket frontend disabled (startup failed); "
+                            "the /dev/md socket is unaffected");
+    } else {
+      syslog(LOG_INFO, "WebSocket frontend disabled by motors.ws_enabled");
+    }
+    // motor_ws_start() already wiped ws_cfg.token; do it again so the local
+    // copy is clean on the path where the listener never started.
+    memset(&ws_cfg, 0, sizeof(ws_cfg));
   }
 
   syslog(LOG_INFO, "motors-daemon started");
