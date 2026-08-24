@@ -399,6 +399,45 @@ static const char *json_str(JsonValue *obj, const char *key) {
   return NULL;
 }
 
+/* Every legitimate command is a flat object (depth 1: {"cmd":"move","x":1,...}
+ * with no nested objects/arrays at all). libjct's parse_json_string() recurses
+ * once per nesting level with no depth limit of its own - confirmed by direct
+ * test that a run of ~700 nested '[' on a connection thread's 64 KB stack
+ * overflows it and crashes the whole daemon (not just this connection), well
+ * within WS_MAX_PAYLOAD's 2048-byte cap. That byte cap bounds payload size,
+ * not recursion depth - they are different resources. Loopback callers skip
+ * the token entirely (see client_authorized()), so this has to reject before
+ * parse_json_string() ever runs, not rely on auth to keep it out. Quoted
+ * brackets don't count: a string value containing '[' is not nesting. */
+#define JSON_MAX_NEST_DEPTH 8
+
+static bool json_nesting_too_deep(const char *text) {
+  int depth = 0;
+  bool in_string = false;
+  bool escaped = false;
+
+  for (const char *p = text; *p; p++) {
+    if (in_string) {
+      if (escaped)
+        escaped = false;
+      else if (*p == '\\')
+        escaped = true;
+      else if (*p == '"')
+        in_string = false;
+      continue;
+    }
+    if (*p == '"')
+      in_string = true;
+    else if (*p == '{' || *p == '[') {
+      if (++depth > JSON_MAX_NEST_DEPTH)
+        return true;
+    } else if (*p == '}' || *p == ']') {
+      depth--;
+    }
+  }
+  return false;
+}
+
 /* Returns WS_OK to continue the connection, anything else to tear it down. */
 static int handle_command(ws_client *c, const char *text) {
   JsonValue *root;
@@ -407,6 +446,9 @@ static int handle_command(ws_client *c, const char *text) {
   long long v = 0;
   int speed = 0;
   int rc = WS_OK;
+
+  if (json_nesting_too_deep(text))
+    return send_error(c, -1, "bad_json", "nested too deeply");
 
   root = parse_json_string(text);
   if (!root)
