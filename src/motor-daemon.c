@@ -71,7 +71,7 @@ typedef struct {
   double joystick_curve_exp; // see vector_axis_speed()
 } MotorConfig;
 
-#define VECTOR_CURVE_EXP_DEFAULT 0.25
+#define VECTOR_CURVE_EXP_DEFAULT 2.0
 
 static MotorConfig g_cfg = {
     .loglevel = 0,
@@ -446,8 +446,8 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
 
   double curve_exp;
   if (json_get_double_jct(motors, "joystick_sensitivity", &curve_exp)) {
-    // Valid range 0.05..2.0; see vector_axis_speed().
-    if (curve_exp < 0.05 || curve_exp > 2.0)
+    // Valid range 0.05..4.0; see vector_axis_speed().
+    if (curve_exp < 0.05 || curve_exp > 4.0)
       curve_exp = VECTOR_CURVE_EXP_DEFAULT;
     g_cfg.joystick_curve_exp = curve_exp;
     parsed = true;
