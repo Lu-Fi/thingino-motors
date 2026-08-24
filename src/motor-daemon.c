@@ -68,7 +68,16 @@ typedef struct {
   AxisCfg tilt; // Y axis
   MotorHwCfg hw;
   bool loaded; // whether configuration was loaded
+  // Exponent of the joystick vector-speed curve; see vector_axis_speed()
+  // and VECTOR_CURVE_EXP_DEFAULT below.
+  double joystick_curve_exp;
 } MotorConfig;
+
+// Default/fallback for MotorConfig.joystick_curve_exp - see
+// vector_axis_speed() for what the exponent actually does. Also the value
+// reset_config_defaults() and load_config_file()'s out-of-range clamp fall
+// back to.
+#define VECTOR_CURVE_EXP_DEFAULT 0.25
 
 static MotorConfig g_cfg = {
     .loglevel = 0,
@@ -76,6 +85,7 @@ static MotorConfig g_cfg = {
     .tilt = {0, 0, 0, 0, 0},
     .hw = {0},
     .loaded = false,
+    .joystick_curve_exp = VECTOR_CURVE_EXP_DEFAULT,
 };
 
 static bool debug_mode = false;
@@ -174,6 +184,34 @@ static int json_get_int_jct(JsonValue *obj, const char *key, int *out) {
     long parsed = strtol(value->value.string, &endptr, 10);
     if (endptr && *endptr == '\0') {
       *out = (int)parsed;
+      return 1;
+    }
+  }
+
+  return 0;
+}
+
+static int json_get_double_jct(JsonValue *obj, const char *key, double *out) {
+  if (!obj || obj->type != JSON_OBJECT || !key || !out)
+    return 0;
+
+  JsonValue *value = get_object_item(obj, key);
+  if (!value)
+    return 0;
+
+  if (value->type == JSON_NUMBER) {
+    *out = (value->value.number.kind == JSON_NUMBER_INT
+                ? (double)value->value.number.integer
+                : value->value.number.real);
+    return 1;
+  }
+
+  if (value->type == JSON_STRING && value->value.string &&
+      value->value.string[0] != '\0') {
+    char *endptr = NULL;
+    double parsed = strtod(value->value.string, &endptr);
+    if (endptr && *endptr == '\0') {
+      *out = parsed;
       return 1;
     }
   }
@@ -295,6 +333,7 @@ static void reset_config_defaults(void) {
   g_cfg.hw.gpio_switch = -1;
   g_cfg.hw.gpio_power = -1;
   g_cfg.loaded = false;
+  g_cfg.joystick_curve_exp = VECTOR_CURVE_EXP_DEFAULT;
 }
 
 static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
@@ -410,6 +449,21 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
   parsed |= json_get_int_jct(motors, "timeout_tilt", &g_cfg.tilt.timeout);
   parsed |= json_get_int_jct(motors, "home_pan", &g_cfg.pan.home);
   parsed |= json_get_int_jct(motors, "home_tilt", &g_cfg.tilt.home);
+
+  double curve_exp;
+  if (json_get_double_jct(motors, "joystick_sensitivity", &curve_exp)) {
+    // Below ~0.05 the curve is nearly a step function (any deflection past
+    // the dead zone reads as ~full speed), and pow() of a ratio that can be
+    // exactly 0.0 by a negative-ish exponent is undefined territory best
+    // avoided rather than merely clamped after the fact. Above 1.0 the curve
+    // stops being more sensitive than linear, which defeats the point of the
+    // setting - so this is the field's whole usable range, not just a sanity
+    // floor/ceiling.
+    if (curve_exp < 0.05 || curve_exp > 1.0)
+      curve_exp = VECTOR_CURVE_EXP_DEFAULT;
+    g_cfg.joystick_curve_exp = curve_exp;
+    parsed = true;
+  }
 
   return parsed;
 }
@@ -1675,14 +1729,17 @@ static void vector_release(void) {
   pthread_mutex_unlock(&vector_lock);
 }
 
-// Exponent of the deflection-to-speed curve (see vector_axis_speed()).
-// 1.0 would be linear; smaller values push more of the speed range toward
-// the dead-zone edge, making small deflections near centre more sensitive
-// at the cost of the curve flattening out - and so reaching top speed -
-// earlier in the throw. Started at 0.5 (square root), then 0.35 - both
-// still felt too linear close to centre.
-#define VECTOR_CURVE_EXP 0.25
-
+// Exponent of the deflection-to-speed curve. 1.0 would be linear; smaller
+// values push more of the speed range toward the dead-zone edge, making
+// small deflections near centre more sensitive at the cost of the curve
+// flattening out - and so reaching top speed - earlier in the throw.
+// User-configurable as motors.joystick_sensitivity in /etc/thingino.json
+// (g_cfg.joystick_curve_exp, parsed and range-checked in
+// parse_modern_layout()); VECTOR_CURVE_EXP_DEFAULT is only the fallback
+// for a missing/invalid value. Settled here at 0.25 after starting at 0.5
+// (square root) and 0.35, both of which still felt too linear close to
+// centre - but taste in this is exactly why it is a config value now
+// rather than a rebuild.
 static int vector_axis_speed(int deflection, int ref_speed) {
   int mag = (deflection < 0) ? -deflection : deflection;
   double ratio, pct;
@@ -1700,7 +1757,7 @@ static int vector_axis_speed(int deflection, int ref_speed) {
   // the rim (faster ramp-up toward the outside) instead of needing the very
   // last bit of travel to get there. Both endpoints are unchanged either
   // way: ratio 0 stays 0, ratio 1 stays 1.
-  ratio = pow(ratio, VECTOR_CURVE_EXP);
+  ratio = pow(ratio, g_cfg.joystick_curve_exp);
   pct = VECTOR_MIN_SPEED_PCT + (100 - VECTOR_MIN_SPEED_PCT) * ratio;
 
   return (int)(((double)ref_speed * pct) / 100.0);
@@ -2021,8 +2078,9 @@ bool motor_ctl_reload(struct motor_message *out) {
 
   motor_ctl_lock();
 
-  // Lets invert_x/invert_y (and speeds, accel, timeouts, pos_0) take
-  // effect without restarting this process and, critically, without
+  // Lets invert_x/invert_y (and speeds, accel, timeouts, pos_0,
+  // joystick_sensitivity) take effect without restarting this process and,
+  // critically, without
   // the modprobe -r/modprobe cycle in "S59motor restart" that has
   // oopsed live kernels. The kernel module is never touched here:
   // no ioctl is issued beyond the ordinary status read for the ack,
