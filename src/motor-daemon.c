@@ -446,8 +446,11 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
 
   double curve_exp;
   if (json_get_double_jct(motors, "joystick_sensitivity", &curve_exp)) {
-    // Valid range 0.05..4.0; see vector_axis_speed().
-    if (curve_exp < 0.05 || curve_exp > 4.0)
+    // Valid range 0.05..4.0; see vector_axis_speed(). isnan() first: every
+    // comparison with NaN is false, so the range check below would silently
+    // accept a NaN string ("nan" parses cleanly via strtod()) and pow() of
+    // it later poisons pct/sx/sy with UB on the double->int cast.
+    if (isnan(curve_exp) || curve_exp < 0.05 || curve_exp > 4.0)
       curve_exp = VECTOR_CURVE_EXP_DEFAULT;
     g_cfg.joystick_curve_exp = curve_exp;
     parsed = true;
