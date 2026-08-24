@@ -19,6 +19,8 @@
 #include <sys/types.h>
 #include <sys/un.h>
 
+#include "motor-ctl.h"
+
 // Configuration structures
 #define MOTOR_GPIO_STR_LEN 64
 #define MOTOR_POS_STR_LEN 32
@@ -563,16 +565,9 @@ static bool load_config_file(void) {
 #define MOTOR_ACTIVE_FLAG "/run/motors-active"
 #define PID_SIZE 32
 
-enum motor_status {
-  MOTOR_IS_STOP,
-  MOTOR_IS_RUNNING,
-  // Only ever sent as the status field of the 'R' (reload) ack, never
-  // produced by MOTOR_GET_STATUS. Lets "motors -R" tell a failed reload
-  // (config missing/invalid, defaults now in effect) apart from a normal
-  // idle/running status without changing the wire format for any other
-  // command. Keep this enum's values identical to the copy in motor.c.
-  MOTOR_RELOAD_FAILED,
-};
+// enum motor_status and struct motor_message moved to motor-ctl.h so that
+// motor-ws.c can build status pushes from the same declarations. The rest of
+// the AF_UNIX wire structs stay here: the WebSocket frontend never sees them.
 
 struct request {
   char command; // d,r,s,p,b,S,i,j,R (move, reset,set speed,get position, is
@@ -594,17 +589,6 @@ struct motor_status_st {
   int max_speed;
   int move_is_min;
   int move_is_max;
-};
-
-struct motor_message {
-  int x;
-  int y;
-  enum motor_status status;
-  int speed;
-  /* these two members are not standard from the original kernel module */
-  unsigned int x_max_steps;
-  unsigned int y_max_steps;
-  unsigned int inversion_state; // Report the inversion state
 };
 
 struct motors_steps {
@@ -647,6 +631,7 @@ static void motor_set_axis_speed(int x_speed, int y_speed);
 static bool motion_is_cancelled(unsigned int generation);
 static void write_motion_active_flag(void);
 static void remove_motion_active_flag(void);
+static void start_motion_active_tracker(void);
 static int get_motion_timeout_ms(void);
 static void physical_delta_to_steps(int *dx, int *dy);
 
@@ -1385,6 +1370,383 @@ static int enhanced_homing_daemon(int stepspeed) {
   return 0;
 }
 
+// ===================================================================
+// Command handlers.
+//
+// Every function below is the body of one case of main()'s old
+// `switch (request_message.command)` block, moved verbatim - same clamps,
+// same edge deadbands, same frame conversions, same syslog lines, same order
+// of ioctls. The only changes are mechanical: locals that used to be main()'s
+// (motor_message, motor_reset_data) became locals here, and the two cases
+// that mutated request_message purely so the trailing syslog could print the
+// adjusted value now hand that value back through an out-parameter.
+//
+// See motor-ctl.h for why they all take a single command mutex.
+// ===================================================================
+
+static pthread_mutex_t command_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void motor_ctl_lock(void) { pthread_mutex_lock(&command_lock); }
+
+bool motor_ctl_trylock(void) {
+  return pthread_mutex_trylock(&command_lock) == 0;
+}
+
+void motor_ctl_unlock(void) { pthread_mutex_unlock(&command_lock); }
+
+int motor_ctl_resolve_speed(int requested_speed) {
+  int request_speed;
+
+  motor_ctl_lock();
+  request_speed = sanitize_requested_speed(0, last_known_speed);
+
+  if (requested_speed != 0) {
+    request_speed = sanitize_requested_speed(requested_speed, last_known_speed);
+    last_known_speed = request_speed;
+    motor_set_axis_speed(last_known_speed, last_known_speed);
+    syslog(LOG_DEBUG, "Using request speed %d (last known updated to %d)",
+           request_speed, last_known_speed);
+  } else {
+    syslog(LOG_DEBUG, "Using last known speed %d", request_speed);
+  }
+
+  motor_ctl_unlock();
+  return request_speed;
+}
+
+void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
+                        int *applied_y) {
+  struct motor_message motor_message;
+
+  motor_ctl_lock();
+
+  motor_status_get(&motor_message);
+  {
+    int target_x = motor_message.x + rel_x;
+    int target_y = motor_message.y + rel_y;
+    int runtime_x_max =
+        (motor_message.x_max_steps > 0)
+            ? (int)motor_message.x_max_steps
+            : ((g_cfg.loaded && g_cfg.pan.max_steps > 0) ? g_cfg.pan.max_steps
+                                                         : 0);
+    int runtime_y_max =
+        (motor_message.y_max_steps > 0)
+            ? (int)motor_message.y_max_steps
+            : ((g_cfg.loaded && g_cfg.tilt.max_steps > 0) ? g_cfg.tilt.max_steps
+                                                          : 0);
+
+    if (runtime_x_max > 0) {
+      if (target_x < 0)
+        target_x = 0;
+      if (target_x > runtime_x_max)
+        target_x = runtime_x_max;
+    }
+    if (runtime_y_max > 0) {
+      if (target_y < 0)
+        target_y = 0;
+      if (target_y > runtime_y_max)
+        target_y = runtime_y_max;
+    }
+
+    // At edges, suppress tiny corrective oscillation from repeated
+    // relative pushes and stale position updates.
+    const int edge_deadband = 24;
+    if (runtime_x_max > 0) {
+      if ((target_x >= runtime_x_max - edge_deadband &&
+           motor_message.x >= runtime_x_max - edge_deadband) ||
+          (target_x <= edge_deadband && motor_message.x <= edge_deadband)) {
+        target_x = motor_message.x;
+      }
+    }
+    if (runtime_y_max > 0) {
+      if ((target_y >= runtime_y_max - edge_deadband &&
+           motor_message.y >= runtime_y_max - edge_deadband) ||
+          (target_y <= edge_deadband && motor_message.y <= edge_deadband)) {
+        target_y = motor_message.y;
+      }
+
+      // If we are already running at a mechanical edge, ignore
+      // additional relative Y nudges until motion settles.
+      if (motor_message.status == MOTOR_IS_RUNNING &&
+          (motor_message.y <= edge_deadband ||
+           motor_message.y >= runtime_y_max - edge_deadband)) {
+        target_y = motor_message.y;
+      }
+    }
+
+    rel_x = target_x - motor_message.x;
+    rel_y = target_y - motor_message.y;
+
+    if (applied_x)
+      *applied_x = rel_x;
+    if (applied_y)
+      *applied_y = rel_y;
+
+    dispatch_profiled_move(rel_x, rel_y, speed, "Profiled driver move started");
+  }
+
+  motor_ctl_unlock();
+}
+
+void motor_ctl_absolute(int x, int got_x, int y, int got_y, int speed,
+                        int *target_x_out, int *target_y_out) {
+  struct motor_message motor_message;
+
+  motor_ctl_lock();
+
+  motor_status_get(&motor_message);
+  // The target arrives in the logical frame; everything below this
+  // point is raw. An axis the caller did not specify keeps the raw
+  // current position, so it must not be mirrored.
+  if (got_x == 0)
+    x = motor_message.x; // as we are rewriting initial between requests
+                         // this should not be necessary but leaving as
+                         // is as to not break anything
+  else
+    x = motor_x_to_raw(x, &motor_message);
+  if (got_y == 0)
+    y = motor_message.y;
+  else
+    y = motor_y_to_raw(y, &motor_message);
+  {
+    int target_x = x;
+    int target_y = y;
+
+    int cfg_x_max =
+        (g_cfg.loaded && g_cfg.pan.max_steps > 0) ? g_cfg.pan.max_steps : 0;
+    int cfg_y_max =
+        (g_cfg.loaded && g_cfg.tilt.max_steps > 0) ? g_cfg.tilt.max_steps : 0;
+    int runtime_x_max = (motor_message.x_max_steps > 0)
+                            ? (int)motor_message.x_max_steps
+                            : cfg_x_max;
+    int runtime_y_max = (motor_message.y_max_steps > 0)
+                            ? (int)motor_message.y_max_steps
+                            : cfg_y_max;
+
+    // If UI requests configured edge but runtime edge is slightly
+    // larger, snap to runtime edge to avoid visible rebound.
+    if (runtime_x_max > 0 && cfg_x_max > 0 && target_x >= (cfg_x_max - 1) &&
+        runtime_x_max > cfg_x_max)
+      target_x = runtime_x_max;
+    if (runtime_y_max > 0 && cfg_y_max > 0 && target_y >= (cfg_y_max - 1) &&
+        runtime_y_max > cfg_y_max)
+      target_y = runtime_y_max;
+
+    if (runtime_x_max > 0) {
+      if (target_x < 0)
+        target_x = 0;
+      if (target_x > runtime_x_max)
+        target_x = runtime_x_max;
+    }
+    if (runtime_y_max > 0) {
+      if (target_y < 0)
+        target_y = 0;
+      if (target_y > runtime_y_max)
+        target_y = runtime_y_max;
+    }
+
+    // At mechanical edges, ignore tiny corrective nudges that cause
+    // bounce when command and current are already at the same edge.
+    const int edge_deadband = 24;
+    if (runtime_x_max > 0) {
+      if ((target_x >= runtime_x_max - edge_deadband &&
+           motor_message.x >= runtime_x_max - edge_deadband) ||
+          (target_x <= edge_deadband && motor_message.x <= edge_deadband)) {
+        target_x = motor_message.x;
+      }
+    }
+    if (runtime_y_max > 0) {
+      if ((target_y >= runtime_y_max - edge_deadband &&
+           motor_message.y >= runtime_y_max - edge_deadband) ||
+          (target_y <= edge_deadband && motor_message.y <= edge_deadband)) {
+        target_y = motor_message.y;
+      }
+    }
+
+    int rel_x = target_x - motor_message.x;
+    int rel_y = target_y - motor_message.y;
+
+    if (target_x_out)
+      *target_x_out = target_x;
+    if (target_y_out)
+      *target_y_out = target_y;
+
+    physical_delta_to_steps(&rel_x, &rel_y);
+    dispatch_profiled_move(rel_x, rel_y, speed,
+                           "Profiled driver absolute move started");
+  }
+
+  motor_ctl_unlock();
+}
+
+void motor_ctl_goback(void) {
+  motor_ctl_lock();
+  motion_cancel_all(true);
+  motor_ioctl(MOTOR_GOBACK, NULL);
+  start_motion_active_tracker();
+  motor_ctl_unlock();
+}
+
+void motor_ctl_cruise(void) {
+  motor_ctl_lock();
+  motion_cancel_all(true);
+  motor_ioctl(MOTOR_CRUISE, NULL);
+  start_motion_active_tracker();
+  motor_ctl_unlock();
+}
+
+void motor_ctl_stop(void) {
+  motor_ctl_lock();
+  motion_cancel_all(true);
+  remove_motion_active_flag();
+  motor_ctl_unlock();
+}
+
+void motor_ctl_home(int speed) {
+  struct motor_reset_data motor_reset_data;
+
+  motor_ctl_lock();
+  motion_cancel_all(true);
+  syslog(LOG_DEBUG, "== Enhanced homing (reset), please wait");
+  write_motion_active_flag();
+  if (enhanced_homing_daemon(speed) != 0) {
+    syslog(LOG_DEBUG,
+           "Enhanced homing failed, falling back to legacy MOTOR_RESET.");
+    memset(&motor_reset_data, 0, sizeof(motor_reset_data));
+    motor_ioctl(MOTOR_RESET, &motor_reset_data);
+  }
+  remove_motion_active_flag();
+  motor_ctl_unlock();
+}
+
+void motor_ctl_status(struct motor_message *out) {
+  motor_ctl_lock();
+  motor_status_get_logical(out);
+  motor_ctl_unlock();
+}
+
+void motor_ctl_set_speed(int speed) {
+  motor_ctl_lock();
+  last_known_speed = sanitize_requested_speed(speed, last_known_speed);
+  motor_set_axis_speed(last_known_speed, last_known_speed);
+  syslog(LOG_DEBUG, "Set speed command, last known speed now %d",
+         last_known_speed);
+  motor_ctl_unlock();
+}
+
+void motor_ctl_invert(char axis) {
+  motor_ctl_lock();
+  switch (axis) {
+  case 'x': // Invert X only
+    motor_inversion_state ^= MOTOR_INVERT_X;
+    syslog(LOG_DEBUG, "Motor inversion X set to %s",
+           (motor_inversion_state & MOTOR_INVERT_X) ? "ON" : "OFF");
+    break;
+  case 'y': // Invert Y only
+    motor_inversion_state ^= MOTOR_INVERT_Y;
+    syslog(LOG_DEBUG, "Motor inversion Y set to %s",
+           (motor_inversion_state & MOTOR_INVERT_Y) ? "ON" : "OFF");
+    break;
+  case 'b': // Invert both X and Y
+    motor_inversion_state ^= MOTOR_INVERT_BOTH;
+    syslog(LOG_DEBUG, "Motor inversion set to %s",
+           (motor_inversion_state == MOTOR_INVERT_BOTH) ? "BOTH ON"
+                                                        : "BOTH OFF");
+    break;
+  default:
+    syslog(LOG_DEBUG, "Invalid inversion command type.");
+    break;
+  }
+  motor_ctl_unlock();
+}
+
+bool motor_ctl_reload(struct motor_message *out) {
+  bool reload_ok;
+
+  motor_ctl_lock();
+
+  // Lets invert_x/invert_y (and speeds, accel, timeouts, pos_0) take
+  // effect without restarting this process and, critically, without
+  // the modprobe -r/modprobe cycle in "S59motor restart" that has
+  // oopsed live kernels. The kernel module is never touched here:
+  // no ioctl is issued beyond the ordinary status read for the ack,
+  // and the position counter lives in the driver, so tracking is
+  // preserved across the reload.
+  //
+  // The async move workers read g_cfg without locking (established
+  // behavior throughout this file), so cancel any in-flight profiled
+  // move and let it wind down before rewriting the config under it.
+  // Note that the command mutex held here does NOT protect against those
+  // workers - it only keeps a second FRONTEND out. The cancel-and-wait
+  // below remains the actual mechanism, exactly as before.
+  motion_cancel_all(true);
+  remove_motion_active_flag();
+  if (wait_until_idle(2000, 20) != 0)
+    syslog(LOG_WARNING, "motors -R: motors still moving after 2s wait; "
+                        "reloading config anyway");
+  usleep(50 * 1000); // let cancelled workers pass their final checks
+
+  reload_ok = load_config_file();
+  apply_config_speed_default();
+
+  if (!reload_ok) {
+    // load_config_file() already reset g_cfg to defaults (see its
+    // own early-return logging above for the specific reason), so
+    // g_cfg.loaded is now false: max-step overrides and position
+    // clamping in motor_status_get() are gone until the next
+    // successful load. Do not ack success.
+    syslog(LOG_WARNING,
+           "motors -R: reload FAILED (/etc/thingino.json missing, "
+           "unreadable, or not a JSON object); config reset to "
+           "defaults, previous settings are NOT in effect");
+  } else {
+    syslog(LOG_INFO,
+           "Config reloaded from /etc/thingino.json (inversion=0x%x, "
+           "default speed=%d)",
+           (unsigned int)motor_inversion_state, last_known_speed);
+
+    // steps_pan/steps_tilt are real kernel module parameters
+    // (hmaxstep/vmaxstep); seed_driver_limits_from_config() only
+    // ever (re)programs them once at startup (limits_seeded), and
+    // deliberately not here, because doing so needs MOTOR_RESET,
+    // which would destroy the position tracking this reload path
+    // exists to preserve. If the freshly loaded config now disagrees
+    // with what the kernel actually has loaded, userspace's
+    // clamping/mirroring math (motor_status_get(),
+    // motor_status_get_logical(), motor_x_to_raw()) silently
+    // desyncs from kernel-enforced limits. Warn loudly; do not
+    // try to auto-fix it here.
+    unsigned int kernel_max_x = 0, kernel_max_y = 0;
+    motor_get_maxsteps_sysfs(&kernel_max_x, &kernel_max_y);
+    bool pan_mismatch = kernel_max_x > 0 && g_cfg.pan.max_steps > 0 &&
+                        kernel_max_x != (unsigned int)g_cfg.pan.max_steps;
+    bool tilt_mismatch = kernel_max_y > 0 && g_cfg.tilt.max_steps > 0 &&
+                         kernel_max_y != (unsigned int)g_cfg.tilt.max_steps;
+    if (pan_mismatch || tilt_mismatch) {
+      syslog(LOG_WARNING,
+             "motors -R: reloaded steps_pan/steps_tilt (%d/%d) "
+             "differ from the kernel's already-loaded limits "
+             "(hmaxstep=%u, vmaxstep=%u); a full restart (S59motor "
+             "restart / reboot) is required for the new step "
+             "limits to take effect at the kernel level",
+             g_cfg.pan.max_steps, g_cfg.tilt.max_steps, kernel_max_x,
+             kernel_max_y);
+    }
+  }
+
+  // Ack with fresh logical status so "motors -R" callers can verify
+  // the new inversion state took effect. Note: keys that are kernel
+  // module parameters (gpio pins, hmaxstep/vmaxstep) are re-read
+  // into g_cfg but cannot reprogram the loaded module; they still
+  // need a full stop/start of S59motor.
+  motor_status_get_logical(out);
+  if (!reload_ok)
+    out->status = MOTOR_RELOAD_FAILED;
+
+  motor_ctl_unlock();
+  return reload_ok;
+}
+
 int check_pid(char *file_name) {
   FILE *f;
   long pid;
@@ -1683,352 +2045,88 @@ int main(int argc, char *argv[]) {
              errno);
     } else {
       syslog(LOG_DEBUG, "request command is %c", request_message.command);
-      int request_speed = sanitize_requested_speed(0, last_known_speed);
-
-      if (request_message.speed != 0) {
-        request_speed =
-            sanitize_requested_speed(request_message.speed, last_known_speed);
-        last_known_speed = request_speed;
-        motor_set_axis_speed(last_known_speed, last_known_speed);
-        syslog(LOG_DEBUG,
-               "Using request speed %d (last known updated to %d)",
-               request_speed, last_known_speed);
-      } else {
-        syslog(LOG_DEBUG, "Using last known speed %d", request_speed);
-      }
+      // The command bodies now live in the motor_ctl_* handlers above, shared
+      // with the WebSocket frontend (motor-ws.c). This switch is pure
+      // dispatch: unpack the AF_UNIX wire struct, call the handler, write the
+      // AF_UNIX reply. Behaviour is unchanged - including the quirks, such as
+      // 'i'/'j'/'p'/'b' all returning the same status struct.
+      int request_speed = motor_ctl_resolve_speed(request_message.speed);
 
       switch (request_message.command) {
       case 'd': // move direction
         syslog(LOG_DEBUG, "request type is %c", request_message.type);
         switch (request_message.type) {
         case 'g': // relative movement
-          motor_status_get(&motor_message);
-          {
-            int rel_x = request_message.x;
-            int rel_y = request_message.y;
-            int target_x = motor_message.x + rel_x;
-            int target_y = motor_message.y + rel_y;
-            int runtime_x_max =
-                (motor_message.x_max_steps > 0)
-                    ? (int)motor_message.x_max_steps
-                    : ((g_cfg.loaded && g_cfg.pan.max_steps > 0)
-                           ? g_cfg.pan.max_steps
-                           : 0);
-            int runtime_y_max =
-                (motor_message.y_max_steps > 0)
-                    ? (int)motor_message.y_max_steps
-                    : ((g_cfg.loaded && g_cfg.tilt.max_steps > 0)
-                           ? g_cfg.tilt.max_steps
-                           : 0);
-
-            if (runtime_x_max > 0) {
-              if (target_x < 0)
-                target_x = 0;
-              if (target_x > runtime_x_max)
-                target_x = runtime_x_max;
-            }
-            if (runtime_y_max > 0) {
-              if (target_y < 0)
-                target_y = 0;
-              if (target_y > runtime_y_max)
-                target_y = runtime_y_max;
-            }
-
-            // At edges, suppress tiny corrective oscillation from repeated
-            // relative pushes and stale position updates.
-            const int edge_deadband = 24;
-            if (runtime_x_max > 0) {
-              if ((target_x >= runtime_x_max - edge_deadband &&
-                   motor_message.x >= runtime_x_max - edge_deadband) ||
-                  (target_x <= edge_deadband &&
-                   motor_message.x <= edge_deadband)) {
-                target_x = motor_message.x;
-              }
-            }
-            if (runtime_y_max > 0) {
-              if ((target_y >= runtime_y_max - edge_deadband &&
-                   motor_message.y >= runtime_y_max - edge_deadband) ||
-                  (target_y <= edge_deadband &&
-                   motor_message.y <= edge_deadband)) {
-                target_y = motor_message.y;
-              }
-
-              // If we are already running at a mechanical edge, ignore
-              // additional relative Y nudges until motion settles.
-              if (motor_message.status == MOTOR_IS_RUNNING &&
-                  (motor_message.y <= edge_deadband ||
-                   motor_message.y >= runtime_y_max - edge_deadband)) {
-                target_y = motor_message.y;
-              }
-            }
-
-            rel_x = target_x - motor_message.x;
-            rel_y = target_y - motor_message.y;
-
-            request_message.x = rel_x;
-            request_message.y = rel_y;
-            dispatch_profiled_move(rel_x, rel_y, request_speed,
-                                  "Profiled driver move started");
-          }
+          // request_message.x/y are overwritten with the delta that was
+          // actually applied, because the two syslog lines below have always
+          // reported the post-clamp value rather than what the client asked
+          // for.
+          motor_ctl_relative(request_message.x, request_message.y,
+                             request_speed, &request_message.x,
+                             &request_message.y);
           syslog(LOG_DEBUG, "request x is %i", request_message.x);
           syslog(LOG_DEBUG, "request y is %i", request_message.y);
           break;
         case 'h': // absolute movement
-          motor_status_get(&motor_message);
-          // The target arrives in the logical frame; everything below this
-          // point is raw. An axis the caller did not specify keeps the raw
-          // current position, so it must not be mirrored.
-          if (request_message.got_x == 0)
-            request_message.x =
-                motor_message.x; // as we are rewriting initial between requests
-                                 // this should not be necessary but leaving as
-                                 // is as to not break anything
-          else
-            request_message.x =
-                motor_x_to_raw(request_message.x, &motor_message);
-          if (request_message.got_y == 0)
-            request_message.y = motor_message.y;
-          else
-            request_message.y =
-                motor_y_to_raw(request_message.y, &motor_message);
-          {
-            int target_x = request_message.x;
-            int target_y = request_message.y;
-
-            int cfg_x_max = (g_cfg.loaded && g_cfg.pan.max_steps > 0)
-                                ? g_cfg.pan.max_steps
-                                : 0;
-            int cfg_y_max = (g_cfg.loaded && g_cfg.tilt.max_steps > 0)
-                                ? g_cfg.tilt.max_steps
-                                : 0;
-            int runtime_x_max =
-                (motor_message.x_max_steps > 0)
-                    ? (int)motor_message.x_max_steps
-                    : cfg_x_max;
-            int runtime_y_max =
-                (motor_message.y_max_steps > 0)
-                    ? (int)motor_message.y_max_steps
-                    : cfg_y_max;
-
-            // If UI requests configured edge but runtime edge is slightly
-            // larger, snap to runtime edge to avoid visible rebound.
-            if (runtime_x_max > 0 && cfg_x_max > 0 &&
-                target_x >= (cfg_x_max - 1) && runtime_x_max > cfg_x_max)
-              target_x = runtime_x_max;
-            if (runtime_y_max > 0 && cfg_y_max > 0 &&
-                target_y >= (cfg_y_max - 1) && runtime_y_max > cfg_y_max)
-              target_y = runtime_y_max;
-
-            if (runtime_x_max > 0) {
-              if (target_x < 0)
-                target_x = 0;
-              if (target_x > runtime_x_max)
-                target_x = runtime_x_max;
-            }
-            if (runtime_y_max > 0) {
-              if (target_y < 0)
-                target_y = 0;
-              if (target_y > runtime_y_max)
-                target_y = runtime_y_max;
-            }
-
-            // At mechanical edges, ignore tiny corrective nudges that cause
-            // bounce when command and current are already at the same edge.
-            const int edge_deadband = 24;
-            if (runtime_x_max > 0) {
-              if ((target_x >= runtime_x_max - edge_deadband &&
-                   motor_message.x >= runtime_x_max - edge_deadband) ||
-                  (target_x <= edge_deadband &&
-                   motor_message.x <= edge_deadband)) {
-                target_x = motor_message.x;
-              }
-            }
-            if (runtime_y_max > 0) {
-              if ((target_y >= runtime_y_max - edge_deadband &&
-                   motor_message.y >= runtime_y_max - edge_deadband) ||
-                  (target_y <= edge_deadband &&
-                   motor_message.y <= edge_deadband)) {
-                target_y = motor_message.y;
-              }
-            }
-
-            int rel_x = target_x - motor_message.x;
-            int rel_y = target_y - motor_message.y;
-
-            request_message.x = target_x;
-            request_message.y = target_y;
-            physical_delta_to_steps(&rel_x, &rel_y);
-            dispatch_profiled_move(rel_x, rel_y, request_speed,
-                                  "Profiled driver absolute move started");
-          }
+          // Same story: these become the resolved RAW targets before logging.
+          motor_ctl_absolute(request_message.x, request_message.got_x,
+                             request_message.y, request_message.got_y,
+                             request_speed, &request_message.x,
+                             &request_message.y);
           syslog(LOG_DEBUG, "request x is %i", request_message.x);
           syslog(LOG_DEBUG, "request y is %i", request_message.y);
           break;
         case 'b': // go back
-          motion_cancel_all(true);
-          motor_ioctl(MOTOR_GOBACK, NULL);
-          start_motion_active_tracker();
+          motor_ctl_goback();
           break;
         case 'c': // cruise
-          motion_cancel_all(true);
-          motor_ioctl(MOTOR_CRUISE, NULL);
-          start_motion_active_tracker();
+          motor_ctl_cruise();
           break;
         case 's': // stop
-          motion_cancel_all(true);
-          remove_motion_active_flag();
+          motor_ctl_stop();
           break;
         }
         break;
       case 'r': // reset (homing)
-        motion_cancel_all(true);
-        syslog(LOG_DEBUG, "== Enhanced homing (reset), please wait");
-        write_motion_active_flag();
-        if (enhanced_homing_daemon(request_speed) != 0) {
-          syslog(LOG_DEBUG,
-                 "Enhanced homing failed, falling back to legacy MOTOR_RESET.");
-          memset(&motor_reset_data, 0, sizeof(motor_reset_data));
-          motor_ioctl(MOTOR_RESET, &motor_reset_data);
-        }
-        remove_motion_active_flag();
+        motor_ctl_home(request_speed);
         break;
       case 'i': // get initial parameters
         // This doesnt seem right, we are returning current information instead
         // of initial parameters not correcting for now, as we want to have
         // functional parity
-        motor_status_get_logical(&motor_message);
+        motor_ctl_status(&motor_message);
         syslog(LOG_DEBUG, "Got current status to load into command");
         write(clientfd, &motor_message, sizeof(struct motor_message));
         break;
       case 'j': // get json
-        motor_status_get_logical(&motor_message);
+        motor_ctl_status(&motor_message);
         syslog(LOG_DEBUG, "Got current status to load into command");
         write(clientfd, &motor_message, sizeof(struct motor_message));
         break;
       case 'p': // get simple x y position
-        motor_status_get_logical(&motor_message);
+        motor_ctl_status(&motor_message);
         syslog(LOG_DEBUG, "Got current status to load into command");
         write(clientfd, &motor_message, sizeof(struct motor_message));
 
         break;
       case 'b': // is busy
-        motor_status_get_logical(&motor_message);
+        motor_ctl_status(&motor_message);
         syslog(LOG_DEBUG, "Got current status to load into command");
         write(clientfd, &motor_message, sizeof(struct motor_message));
 
         break;
       case 's': // set speed
-         last_known_speed =
-             sanitize_requested_speed(request_message.speed, last_known_speed);
-        motor_set_axis_speed(last_known_speed, last_known_speed);
-        syslog(LOG_DEBUG, "Set speed command, last known speed now %d",
-               last_known_speed);
+        motor_ctl_set_speed(request_message.speed);
         break;
       case 'I': // Invert motor direction
-        switch (request_message.type) {
-        case 'x': // Invert X only
-          motor_inversion_state ^= MOTOR_INVERT_X;
-          syslog(LOG_DEBUG, "Motor inversion X set to %s",
-                 (motor_inversion_state & MOTOR_INVERT_X) ? "ON" : "OFF");
-          break;
-        case 'y': // Invert Y only
-          motor_inversion_state ^= MOTOR_INVERT_Y;
-          syslog(LOG_DEBUG, "Motor inversion Y set to %s",
-                 (motor_inversion_state & MOTOR_INVERT_Y) ? "ON" : "OFF");
-          break;
-        case 'b': // Invert both X and Y
-          motor_inversion_state ^= MOTOR_INVERT_BOTH;
-          syslog(LOG_DEBUG, "Motor inversion set to %s",
-                 (motor_inversion_state == MOTOR_INVERT_BOTH) ? "BOTH ON"
-                                                              : "BOTH OFF");
-          break;
-        default:
-          syslog(LOG_DEBUG, "Invalid inversion command type.");
-          break;
-        }
+        motor_ctl_invert(request_message.type);
         break;
       case 'R': // reload userspace config from /etc/thingino.json
-        // Lets invert_x/invert_y (and speeds, accel, timeouts, pos_0) take
-        // effect without restarting this process and, critically, without
-        // the modprobe -r/modprobe cycle in "S59motor restart" that has
-        // oopsed live kernels. The kernel module is never touched here:
-        // no ioctl is issued beyond the ordinary status read for the ack,
-        // and the position counter lives in the driver, so tracking is
-        // preserved across the reload.
-        //
-        // The async move workers read g_cfg without locking (established
-        // behavior throughout this file), so cancel any in-flight profiled
-        // move and let it wind down before rewriting the config under it.
-        motion_cancel_all(true);
-        remove_motion_active_flag();
-        if (wait_until_idle(2000, 20) != 0)
-          syslog(LOG_WARNING,
-                 "motors -R: motors still moving after 2s wait; reloading "
-                 "config anyway");
-        usleep(50 * 1000); // let cancelled workers pass their final checks
-
-        {
-          bool reload_ok = load_config_file();
-          apply_config_speed_default();
-
-          if (!reload_ok) {
-            // load_config_file() already reset g_cfg to defaults (see its
-            // own early-return logging above for the specific reason), so
-            // g_cfg.loaded is now false: max-step overrides and position
-            // clamping in motor_status_get() are gone until the next
-            // successful load. Do not ack success.
-            syslog(LOG_WARNING,
-                   "motors -R: reload FAILED (/etc/thingino.json missing, "
-                   "unreadable, or not a JSON object); config reset to "
-                   "defaults, previous settings are NOT in effect");
-          } else {
-            syslog(LOG_INFO,
-                   "Config reloaded from /etc/thingino.json (inversion=0x%x, "
-                   "default speed=%d)",
-                   (unsigned int)motor_inversion_state, last_known_speed);
-
-            // steps_pan/steps_tilt are real kernel module parameters
-            // (hmaxstep/vmaxstep); seed_driver_limits_from_config() only
-            // ever (re)programs them once at startup (limits_seeded), and
-            // deliberately not here, because doing so needs MOTOR_RESET,
-            // which would destroy the position tracking this reload path
-            // exists to preserve. If the freshly loaded config now disagrees
-            // with what the kernel actually has loaded, userspace's
-            // clamping/mirroring math (motor_status_get(),
-            // motor_status_get_logical(), motor_x_to_raw()) silently
-            // desyncs from kernel-enforced limits. Warn loudly; do not
-            // try to auto-fix it here.
-            unsigned int kernel_max_x = 0, kernel_max_y = 0;
-            motor_get_maxsteps_sysfs(&kernel_max_x, &kernel_max_y);
-            bool pan_mismatch = kernel_max_x > 0 && g_cfg.pan.max_steps > 0 &&
-                                kernel_max_x != (unsigned int)g_cfg.pan.max_steps;
-            bool tilt_mismatch = kernel_max_y > 0 && g_cfg.tilt.max_steps > 0 &&
-                                 kernel_max_y != (unsigned int)g_cfg.tilt.max_steps;
-            if (pan_mismatch || tilt_mismatch) {
-              syslog(LOG_WARNING,
-                     "motors -R: reloaded steps_pan/steps_tilt (%d/%d) "
-                     "differ from the kernel's already-loaded limits "
-                     "(hmaxstep=%u, vmaxstep=%u); a full restart (S59motor "
-                     "restart / reboot) is required for the new step "
-                     "limits to take effect at the kernel level",
-                     g_cfg.pan.max_steps, g_cfg.tilt.max_steps, kernel_max_x,
-                     kernel_max_y);
-            }
-          }
-
-          // Ack with fresh logical status so "motors -R" callers can verify
-          // the new inversion state took effect. Note: keys that are kernel
-          // module parameters (gpio pins, hmaxstep/vmaxstep) are re-read
-          // into g_cfg but cannot reprogram the loaded module; they still
-          // need a full stop/start of S59motor.
-          motor_status_get_logical(&motor_message);
-          if (!reload_ok)
-            motor_message.status = MOTOR_RELOAD_FAILED;
-          write(clientfd, &motor_message, sizeof(struct motor_message));
-        }
+        (void)motor_ctl_reload(&motor_message);
+        write(clientfd, &motor_message, sizeof(struct motor_message));
         break;
       case 'S': // show status
-        motor_status_get_logical(&motor_message);
+        motor_ctl_status(&motor_message);
         motor_message.inversion_state = motor_inversion_state;
         write(clientfd, &motor_message, sizeof(struct motor_message));
         syslog(LOG_DEBUG, "Sent motor status");
