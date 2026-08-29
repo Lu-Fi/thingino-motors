@@ -214,6 +214,28 @@ static void send_client_frame(int fd, int opcode, bool fin,
     return;
 }
 
+/* ws.c reads and writes through a ws_io rather than a bare fd, so the tests
+ * need one to point at their socketpair. `tls` stays NULL throughout: this
+ * file links ws.c WITHOUT MOTORS_WS_TLS (see the selftest rule in the
+ * Makefile), so the plain branch is the only one compiled in, and it is also
+ * the only one that could be exercised without a certificate and a real peer.
+ *
+ * One shared instance is safe because the tests run in sequence and each
+ * closes its sockets before the next opens any - but it has to be a static
+ * rather than a local, because ws_conn only BORROWS the handle and outlives
+ * whatever statement set it up. */
+static ws_io test_io;
+
+static ws_io *test_io_for(int fd) {
+  test_io.fd = fd;
+  test_io.tls = NULL;
+  return &test_io;
+}
+
+static void test_conn_init(ws_conn *c, int fd) {
+  ws_conn_init(c, test_io_for(fd));
+}
+
 static void test_frames(void) {
   int sp[2];
   ws_conn c;
@@ -229,7 +251,7 @@ static void test_frames(void) {
   }
 
   /* a normal masked text frame */
-  ws_conn_init(&c, sp[0]);
+  test_conn_init(&c, sp[0]);
   send_client_frame(sp[1], WS_OP_TEXT, true, (const unsigned char *)"{\"a\":1}",
                     7, true);
   rc = ws_read_message(&c, &op, out, sizeof out, &len, 500);
@@ -270,7 +292,7 @@ static void test_frames(void) {
 
   /* an UNMASKED client frame must be refused (RFC 6455 section 5.1) */
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
-    ws_conn_init(&c, sp[0]);
+    test_conn_init(&c, sp[0]);
     send_client_frame(sp[1], WS_OP_TEXT, true, (const unsigned char *)"hi", 2,
                       false);
     rc = ws_read_message(&c, &op, out, sizeof out, &len, 500);
@@ -282,7 +304,7 @@ static void test_frames(void) {
   /* an oversized frame must be refused rather than truncated or allocated */
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
     unsigned char hdr[8] = {0x81, 0xFE, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00};
-    ws_conn_init(&c, sp[0]);
+    test_conn_init(&c, sp[0]);
     /* declares a 65535-byte payload, far over WS_MAX_PAYLOAD */
     if (write(sp[1], hdr, 8) > 0) {
       rc = ws_read_message(&c, &op, out, sizeof out, &len, 500);
@@ -295,7 +317,7 @@ static void test_frames(void) {
   /* a server frame must go out unmasked with the right header shape */
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
     unsigned char hdr[4];
-    ws_send_text(sp[0], "hello");
+    ws_send_text(test_io_for(sp[0]), "hello");
     if (read(sp[1], hdr, 2) == 2) {
       check_int("server frame FIN+TEXT", hdr[0], 0x81);
       check_int("server frame unmasked, len 5", hdr[1], 5);
@@ -329,7 +351,7 @@ static void test_liveness(void) {
     return;
   }
 
-  ws_conn_init(&c, sp[0]);
+  test_conn_init(&c, sp[0]);
   check_int("fresh connection is not idle", ws_conn_idle_ms(&c) < 1000, 1);
 
   /* a PONG is the case the timeout exists for: it carries no data, so before
@@ -360,7 +382,7 @@ static void test_liveness(void) {
    * end. Two header bytes announcing a masked 2-byte payload, then silence. */
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
     unsigned char torn[2] = {0x81, 0x82};
-    ws_conn_init(&c, sp[0]);
+    test_conn_init(&c, sp[0]);
     c.last_rx_ms -= BACKDATE_MS;
     if (write(sp[1], torn, 2) == 2) {
       rc = ws_read_message(&c, &op, out, sizeof out, &len, 100);

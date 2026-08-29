@@ -662,6 +662,27 @@ static void load_ws_config_file(motor_ws_cfg *cfg) {
       strncpy(cfg->origins, s, sizeof(cfg->origins) - 1);
       cfg->origins[sizeof(cfg->origins) - 1] = '\0';
     }
+
+    // TLS. All three keys are optional and none of them needs to be set for
+    // wss:// to work - motor_ws_start() finds the web UI's certificate on its
+    // own. They exist for the two cases it cannot guess: turning wss:// off on
+    // a camera that has a certificate but does not want the listener using it
+    // (ws_tls), and pointing at a certificate somewhere else (ws_tls_cert +
+    // ws_tls_key, which must be given together).
+    if (json_get_bool_jct(motors, "ws_tls", &b))
+      cfg->tls_enabled = b;
+
+    s = json_get_string_jct(motors, "ws_tls_cert");
+    if (s) {
+      strncpy(cfg->tls_cert, s, sizeof(cfg->tls_cert) - 1);
+      cfg->tls_cert[sizeof(cfg->tls_cert) - 1] = '\0';
+    }
+
+    s = json_get_string_jct(motors, "ws_tls_key");
+    if (s) {
+      strncpy(cfg->tls_key, s, sizeof(cfg->tls_key) - 1);
+      cfg->tls_key[sizeof(cfg->tls_key) - 1] = '\0';
+    }
   }
 
   // free_json_value() frees the string that cfg->token was copied out of, so

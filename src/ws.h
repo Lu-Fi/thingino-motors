@@ -14,8 +14,12 @@
  * take ws.c/ws.h verbatim - there is no library to share, so the seam has to
  * carry that weight instead.
  *
- * No TLS. See ws_listen_start() in motor-ws.c for where a wss:// listener
- * would have to sit if anyone adds one. */
+ * TLS (wss://) rides on the ws_io handle below - the one seam every byte read
+ * or written by this file passes through. ws.c itself still knows nothing
+ * about TLS beyond "there may be a ws_tls_conn to call instead of
+ * read()/send()"; the mbedTLS specifics live in ws_tls.c, compiled only when
+ * MOTORS_WS_TLS is defined. The policy - which certificate, and how a plain
+ * ws:// client is still accepted on the same port - is motor-ws.c's. */
 
 /* Frame payload cap.
  *
@@ -57,6 +61,30 @@
 #define WS_ETOOBIG (-3)/* payload over WS_MAX_PAYLOAD -> close 1009 */
 #define WS_EIO (-4)    /* socket error/timeout on a partial frame */
 
+/* --- transport --- *
+ *
+ * Every read and write in ws.c goes through one of these instead of a bare
+ * fd. A plain ws:// connection leaves `tls` NULL and the calls collapse to
+ * read()/send(); a wss:// connection carries the ws_tls_conn that ws_tls.c
+ * handed back and the same calls go through mbedTLS.
+ *
+ * `fd` stays visible rather than being hidden behind the handle because the
+ * things that are NOT byte I/O still need the raw descriptor: poll(),
+ * setsockopt(TCP_NODELAY/SO_KEEPALIVE), and close(). Only the byte movement
+ * is abstracted, which keeps the abstraction to the two functions that
+ * actually differ.
+ *
+ * Ownership: ws.c never allocates or frees either member. The caller accepts
+ * the socket, optionally wraps it (ws_tls_accept), and is responsible for
+ * ws_tls_close() + close() afterwards - see conn_thread() in motor-ws.c. */
+typedef struct {
+  int fd;
+  /* ws_tls_conn *, or NULL for a plain socket. Deliberately void * so this
+   * header stays buildable - and this struct stays one shape - whether or not
+   * the TLS support was compiled in. */
+  void *tls;
+} ws_io;
+
 /* Parsed handshake request. All strings are NUL-terminated and truncated to
  * the buffer size rather than overflowing; a truncated value simply fails to
  * match an allow-list entry, which is the safe direction. */
@@ -86,7 +114,9 @@ typedef struct {
 bool ws_header(const ws_handshake *hs, const char *name, char *out, size_t cap);
 
 typedef struct {
-  int fd;
+  /* Borrowed, not owned: it must outlive the ws_conn. In motor-ws.c both live
+   * in the same per-connection ws_client, so that is automatic. */
+  ws_io *io;
   /* Reassembly buffer for fragmented messages (RFC 6455 section 5.4). Fixed
    * size, so a fragment sequence that would exceed WS_MAX_PAYLOAD in total is
    * rejected with WS_ETOOBIG instead of growing without bound - the classic
@@ -103,7 +133,7 @@ typedef struct {
   long long last_rx_ms;
 } ws_conn;
 
-void ws_conn_init(ws_conn *c, int fd);
+void ws_conn_init(ws_conn *c, ws_io *io);
 
 /* Milliseconds since an arbitrary fixed point, from CLOCK_MONOTONIC where the
  * platform has it. Exposed because every timer in this frontend has to agree
@@ -125,7 +155,7 @@ long long ws_conn_idle_ms(const ws_conn *c);
  * WS_ETOOBIG (head over WS_MAX_HANDSHAKE), WS_EPROTO (malformed request line)
  * or WS_EIO/WS_CLOSED. Does not validate Origin or any credential: that is
  * policy, and policy lives in the caller. */
-int ws_handshake_read(int fd, ws_handshake *hs, int timeout_ms);
+int ws_handshake_read(ws_io *io, ws_handshake *hs, int timeout_ms);
 
 /* True if hs is a structurally valid RFC 6455 version-13 upgrade request
  * (GET, Upgrade: websocket, Connection: ...upgrade..., a Sec-WebSocket-Key,
@@ -139,13 +169,14 @@ bool ws_handshake_is_upgrade(const ws_handshake *hs);
 void ws_accept_key(const char *key, char out[29]);
 
 /* Send the 101 response. subproto may be NULL. */
-int ws_handshake_accept(int fd, const ws_handshake *hs, const char *subproto);
+int ws_handshake_accept(ws_io *io, const ws_handshake *hs,
+                        const char *subproto);
 
 /* Send a plain HTTP error response and nothing else - used for every refusal
  * before the upgrade completes (bad origin, missing token, too many clients).
  * The body is a fixed string; nothing from the request is ever reflected, so
  * this cannot become a reflected-XSS or header-injection surface. */
-int ws_handshake_reject(int fd, int status, const char *status_text,
+int ws_handshake_reject(ws_io *io, int status, const char *status_text,
                         const char *body);
 
 /* --- frames --- */
@@ -163,10 +194,10 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
 
 /* Send an unmasked server frame (RFC 6455 section 5.1: the server MUST NOT
  * mask). Returns WS_OK or WS_EIO. */
-int ws_send_frame(int fd, int opcode, const void *payload, size_t len);
-int ws_send_text(int fd, const char *text);
-int ws_send_ping(int fd);
-int ws_send_close(int fd, int code, const char *reason);
+int ws_send_frame(ws_io *io, int opcode, const void *payload, size_t len);
+int ws_send_text(ws_io *io, const char *text);
+int ws_send_ping(ws_io *io);
+int ws_send_close(ws_io *io, int code, const char *reason);
 
 /* --- base64 --- */
 

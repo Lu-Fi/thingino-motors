@@ -22,6 +22,10 @@
 #include "sha1.h"
 #include "ws.h"
 
+#ifdef MOTORS_WS_TLS
+#include "ws_tls.h"
+#endif
+
 /* RFC 6455 section 1.3. Fixed by the spec, not a secret, not a salt. */
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -92,8 +96,56 @@ size_t ws_base64_encode(const unsigned char *in, size_t len, char *out) {
  * slow-loris defence for this listener.
  * ------------------------------------------------------------------ */
 
-static int poll_readable(int fd, int timeout_ms) {
-  struct pollfd p = {.fd = fd, .events = POLLIN, .revents = 0};
+/* --- the transport seam ---
+ *
+ * Three functions, and nothing else in this file touches the socket. A plain
+ * connection is exactly what it always was; a TLS one substitutes the mbedTLS
+ * equivalents. The contract ws_tls.c has to honour is deliberately the POSIX
+ * one, so the branches below stay two lines each and every caller keeps its
+ * existing error handling:
+ *
+ *   >0  bytes moved
+ *    0  on read, the peer closed
+ *   -1  errno set; EAGAIN/EWOULDBLOCK means "not yet, poll and retry".
+ *
+ * EAGAIN is not hypothetical on the TLS path even though the plain path never
+ * sees it: ws_tls_accept() leaves the socket non-blocking precisely so that a
+ * half-arrived TLS record turns into a poll() this file already knows how to
+ * do, instead of parking the connection thread inside mbedTLS with no
+ * deadline. */
+
+static int io_pending(const ws_io *io) {
+#ifdef MOTORS_WS_TLS
+  if (io->tls)
+    return ws_tls_pending((const ws_tls_conn *)io->tls);
+#else
+  (void)io;
+#endif
+  return 0;
+}
+
+static ssize_t io_read(ws_io *io, void *buf, size_t n) {
+#ifdef MOTORS_WS_TLS
+  if (io->tls)
+    return ws_tls_read((ws_tls_conn *)io->tls, buf, n);
+#endif
+  return read(io->fd, buf, n);
+}
+
+static ssize_t io_write(ws_io *io, const void *buf, size_t n) {
+#ifdef MOTORS_WS_TLS
+  if (io->tls)
+    return ws_tls_write((ws_tls_conn *)io->tls, buf, n);
+#endif
+  /* MSG_NOSIGNAL: a PTZ client that closes its tab mid-push must not take the
+   * whole daemon down with SIGPIPE. The AF_UNIX path never had to care because
+   * it wrote at most one struct to a client that was still blocking on read().
+   * The TLS branch above gets the same protection from ws_tls.c's BIO. */
+  return send(io->fd, buf, n, MSG_NOSIGNAL);
+}
+
+static int poll_fd(int fd, short events, int timeout_ms) {
+  struct pollfd p = {.fd = fd, .events = events, .revents = 0};
   int r;
 
   do {
@@ -111,15 +163,34 @@ static int poll_readable(int fd, int timeout_ms) {
   return WS_OK;
 }
 
+static int poll_readable(ws_io *io, int timeout_ms) {
+  /* Bytes mbedTLS has already decrypted into its own buffer are invisible to
+   * poll() on the raw fd - a whole message can sit there while poll() blocks
+   * the full timeout and then reports WS_AGAIN. Checking first is what stops a
+   * TLS connection from stalling for push_ms on data it already holds. */
+  if (io_pending(io) > 0)
+    return WS_OK;
+  return poll_fd(io->fd, POLLIN, timeout_ms);
+}
+
+/* How long a blocked write may wait before the connection is given up on.
+ * Only ever reached on the TLS path (the plain socket is blocking, so send()
+ * does this waiting inside the kernel); it exists so a peer that stops reading
+ * cannot pin a connection thread forever once mbedTLS starts returning
+ * WANT_WRITE. Generous, because a genuinely slow WiFi client must not be
+ * dropped mid-frame - and a torn write is not resynchronisable, so the only
+ * thing to do when it does expire is close. */
+#define WS_WRITE_TIMEOUT_MS 10000
+
 /* Read exactly n bytes or fail. budget_ms is decremented in place so a caller
  * assembling a multi-part frame shares one deadline across all its reads. */
-static int read_exact(int fd, void *buf, size_t n, int *budget_ms) {
+static int read_exact(ws_io *io, void *buf, size_t n, int *budget_ms) {
   unsigned char *p = (unsigned char *)buf;
   size_t got = 0;
 
   while (got < n) {
     int slice = (*budget_ms > 0) ? *budget_ms : 0;
-    int pr = poll_readable(fd, slice);
+    int pr = poll_readable(io, slice);
     if (pr == WS_AGAIN) {
       *budget_ms = 0;
       /* Timing out with a partial frame in hand is not recoverable: the
@@ -132,11 +203,16 @@ static int read_exact(int fd, void *buf, size_t n, int *budget_ms) {
     if (pr != WS_OK)
       return pr;
 
-    ssize_t r = read(fd, p + got, n - got);
+    ssize_t r = io_read(io, p + got, n - got);
     if (r == 0)
       return WS_CLOSED;
     if (r < 0) {
       if (errno == EINTR)
+        continue;
+      /* TLS only: poll() saw a readable socket but the record it carried was
+       * incomplete, so nothing decrypted out of it yet. Go back and wait for
+       * the rest under the same budget. */
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
         continue;
       return WS_EIO;
     }
@@ -145,19 +221,25 @@ static int read_exact(int fd, void *buf, size_t n, int *budget_ms) {
   return WS_OK;
 }
 
-static int write_all(int fd, const void *buf, size_t n) {
+static int write_all(ws_io *io, const void *buf, size_t n) {
   const unsigned char *p = (const unsigned char *)buf;
   size_t sent = 0;
 
   while (sent < n) {
-    /* MSG_NOSIGNAL: a PTZ client that closes its tab mid-push must not take
-     * the whole daemon down with SIGPIPE. The AF_UNIX path never had to care
-     * because it wrote at most one struct to a client that was still
-     * blocking on read(). */
-    ssize_t w = send(fd, p + sent, n - sent, MSG_NOSIGNAL);
+    ssize_t w = io_write(io, p + sent, n - sent);
     if (w < 0) {
       if (errno == EINTR)
         continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK) {
+        /* POLLIN as well as POLLOUT: mbedTLS can need to READ to make
+         * progress on a write (a post-handshake message it has to consume
+         * first), and ws_tls_write() reports both as EAGAIN. Waiting only for
+         * writability would then spin until the timeout on a socket that is
+         * perfectly writable. */
+        if (poll_fd(io->fd, POLLOUT | POLLIN, WS_WRITE_TIMEOUT_MS) != WS_OK)
+          return WS_EIO;
+        continue;
+      }
       return WS_EIO;
     }
     if (w == 0)
@@ -171,9 +253,9 @@ static int write_all(int fd, const void *buf, size_t n) {
  * handshake
  * ------------------------------------------------------------------ */
 
-void ws_conn_init(ws_conn *c, int fd) {
+void ws_conn_init(ws_conn *c, ws_io *io) {
   memset(c, 0, sizeof(*c));
-  c->fd = fd;
+  c->io = io;
   /* Seed from "now", not from zero: a connection that has just been accepted
    * has not been silent since the epoch, and a zero here would make the very
    * first liveness check fire immediately. */
@@ -228,7 +310,7 @@ bool ws_header(const ws_handshake *hs, const char *name, char *out,
   return false;
 }
 
-int ws_handshake_read(int fd, ws_handshake *hs, int timeout_ms) {
+int ws_handshake_read(ws_io *io, ws_handshake *hs, int timeout_ms) {
   char *buf;
   size_t len = 0;
   int budget = timeout_ms;
@@ -243,18 +325,20 @@ int ws_handshake_read(int fd, ws_handshake *hs, int timeout_ms) {
    * deadline; a client that opens a socket and says nothing is dropped by
    * the deadline, which is the cheap half of the DoS story. */
   for (;;) {
-    int pr = poll_readable(fd, budget > 0 ? budget : 0);
+    int pr = poll_readable(io, budget > 0 ? budget : 0);
     if (pr == WS_AGAIN)
       return WS_EIO; /* handshake never completed */
     if (pr != WS_OK)
       return pr;
 
-    ssize_t r = read(fd, buf + len, WS_MAX_HANDSHAKE - len);
+    ssize_t r = io_read(io, buf + len, WS_MAX_HANDSHAKE - len);
     if (r == 0)
       return WS_CLOSED;
     if (r < 0) {
       if (errno == EINTR)
         continue;
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        continue; /* partial TLS record; see read_exact() */
       return WS_EIO;
     }
     len += (size_t)r;
@@ -355,7 +439,8 @@ void ws_accept_key(const char *key, char out[29]) {
   ws_base64_encode(digest, sizeof(digest), out);
 }
 
-int ws_handshake_accept(int fd, const ws_handshake *hs, const char *subproto) {
+int ws_handshake_accept(ws_io *io, const ws_handshake *hs,
+                        const char *subproto) {
   char accept[29];
   char resp[320];
   int n;
@@ -380,10 +465,10 @@ int ws_handshake_accept(int fd, const ws_handshake *hs, const char *subproto) {
   if (n < 0 || (size_t)n >= sizeof(resp))
     return WS_EIO;
 
-  return write_all(fd, resp, (size_t)n);
+  return write_all(io, resp, (size_t)n);
 }
 
-int ws_handshake_reject(int fd, int status, const char *status_text,
+int ws_handshake_reject(ws_io *io, int status, const char *status_text,
                         const char *body) {
   char resp[512];
   int n = snprintf(resp, sizeof(resp),
@@ -396,14 +481,14 @@ int ws_handshake_reject(int fd, int status, const char *status_text,
                    status, status_text, (unsigned)strlen(body), body);
   if (n < 0 || (size_t)n >= sizeof(resp))
     return WS_EIO;
-  return write_all(fd, resp, (size_t)n);
+  return write_all(io, resp, (size_t)n);
 }
 
 /* ------------------------------------------------------------------ *
  * frames
  * ------------------------------------------------------------------ */
 
-int ws_send_frame(int fd, int opcode, const void *payload, size_t len) {
+int ws_send_frame(ws_io *io, int opcode, const void *payload, size_t len) {
   unsigned char hdr[10];
   size_t hlen = 0;
 
@@ -426,20 +511,20 @@ int ws_send_frame(int fd, int opcode, const void *payload, size_t len) {
     hlen = 10;
   }
 
-  if (write_all(fd, hdr, hlen) != WS_OK)
+  if (write_all(io, hdr, hlen) != WS_OK)
     return WS_EIO;
-  if (len > 0 && write_all(fd, payload, len) != WS_OK)
+  if (len > 0 && write_all(io, payload, len) != WS_OK)
     return WS_EIO;
   return WS_OK;
 }
 
-int ws_send_text(int fd, const char *text) {
-  return ws_send_frame(fd, WS_OP_TEXT, text, strlen(text));
+int ws_send_text(ws_io *io, const char *text) {
+  return ws_send_frame(io, WS_OP_TEXT, text, strlen(text));
 }
 
-int ws_send_ping(int fd) { return ws_send_frame(fd, WS_OP_PING, NULL, 0); }
+int ws_send_ping(ws_io *io) { return ws_send_frame(io, WS_OP_PING, NULL, 0); }
 
-int ws_send_close(int fd, int code, const char *reason) {
+int ws_send_close(ws_io *io, int code, const char *reason) {
   unsigned char buf[125];
   size_t rl = reason ? strlen(reason) : 0;
 
@@ -450,7 +535,7 @@ int ws_send_close(int fd, int code, const char *reason) {
   buf[1] = (unsigned char)(code & 0xFF);
   if (rl)
     memcpy(buf + 2, reason, rl);
-  return ws_send_frame(fd, WS_OP_CLOSE, buf, rl + 2);
+  return ws_send_frame(io, WS_OP_CLOSE, buf, rl + 2);
 }
 
 int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
@@ -459,7 +544,7 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
 
   for (;;) {
     unsigned char h[2];
-    int rc = read_exact(c->fd, h, 2, &budget);
+    int rc = read_exact(c->io, h, 2, &budget);
     if (rc != WS_OK)
       return rc; /* WS_AGAIN here is benign: no frame had started */
 
@@ -486,12 +571,12 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
       unsigned char e[2];
       /* Once a header has started, a timeout means a torn frame - read_exact
        * turns that into WS_EIO for us. */
-      if ((rc = read_exact(c->fd, e, 2, &budget)) != WS_OK)
+      if ((rc = read_exact(c->io, e, 2, &budget)) != WS_OK)
         return (rc == WS_AGAIN) ? WS_EIO : rc;
       plen = ((uint64_t)e[0] << 8) | e[1];
     } else if (plen == 127) {
       unsigned char e[8];
-      if ((rc = read_exact(c->fd, e, 8, &budget)) != WS_OK)
+      if ((rc = read_exact(c->io, e, 8, &budget)) != WS_OK)
         return (rc == WS_AGAIN) ? WS_EIO : rc;
       plen = 0;
       for (int i = 0; i < 8; i++)
@@ -511,12 +596,12 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
       return WS_ETOOBIG;
 
     unsigned char mask[4];
-    if ((rc = read_exact(c->fd, mask, 4, &budget)) != WS_OK)
+    if ((rc = read_exact(c->io, mask, 4, &budget)) != WS_OK)
       return (rc == WS_AGAIN) ? WS_EIO : rc;
 
     unsigned char payload[WS_MAX_PAYLOAD];
     if (plen > 0) {
-      if ((rc = read_exact(c->fd, payload, (size_t)plen, &budget)) != WS_OK)
+      if ((rc = read_exact(c->io, payload, (size_t)plen, &budget)) != WS_OK)
         return (rc == WS_AGAIN) ? WS_EIO : rc;
       for (uint64_t i = 0; i < plen; i++)
         payload[i] ^= mask[i & 3];
@@ -538,7 +623,7 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
       if (op == WS_OP_CLOSE)
         return WS_CLOSED;
       if (op == WS_OP_PING) {
-        if (ws_send_frame(c->fd, WS_OP_PONG, payload, (size_t)plen) != WS_OK)
+        if (ws_send_frame(c->io, WS_OP_PONG, payload, (size_t)plen) != WS_OK)
           return WS_EIO;
       }
       /* WS_OP_PONG: nothing further to do - the stamp above is the whole

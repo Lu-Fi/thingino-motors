@@ -18,8 +18,23 @@
 
 /* Default listen port for ws://<camera>:8089/ws. Configurable via
  * motors.ws_port; 8089 is chosen to sit clear of busybox-httpd (80/443) and
- * of the streamer's HTTP/RTSP ports. */
+ * of the streamer's HTTP/RTSP ports.
+ *
+ * wss:// uses this SAME port - see the first-byte sniff in conn_thread(). */
 #define MOTOR_WS_DEFAULT_PORT 8089
+
+/* Marker file, written while the listener has a usable TLS context and removed
+ * otherwise. Read by json-motor-token.cgi, which reports it to the browser as
+ * {"tls":true} so the page knows to build a wss:// URL - the same shape timps
+ * uses, where /x/timps-token.cgi's "tls" field picks http:// vs https:// for
+ * the preview player (see preview-motion.js).
+ *
+ * A marker rather than having the CGI re-derive the answer from the config: the
+ * daemon's TLS state is the outcome of a certificate actually loading, not of
+ * what the config asked for, and a shell script duplicating that resolution
+ * would eventually disagree with it. Under /run so it cannot survive a reboot
+ * into a build without TLS. */
+#define MOTOR_WS_TLS_FLAG_FILE "/run/motors.tls"
 
 /* Continuous ("hold to move") control: a CLIENT CONVENTION, not a wire mode.
  *
@@ -75,6 +90,13 @@ typedef struct {
   int max_clients;     /* hard cap on simultaneous connections */
   int rate_limit;      /* commands per second, per connection */
   int push_ms;         /* default status push cadence */
+
+  /* TLS (wss://). Off unless a certificate can actually be loaded; see
+   * motor_ws_start(). Never a reason to refuse to start - a camera with no
+   * usable certificate serves plain ws:// exactly as it always did. */
+  bool tls_enabled;    /* motors.ws_tls: false disables wss:// outright */
+  char tls_cert[128];  /* motors.ws_tls_cert; "" = probe the usual places */
+  char tls_key[128];   /* motors.ws_tls_key;  "" = probe the usual places */
 } motor_ws_cfg;
 
 void motor_ws_cfg_defaults(motor_ws_cfg *cfg);

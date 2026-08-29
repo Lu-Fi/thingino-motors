@@ -9,14 +9,17 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <syslog.h>
 #include <unistd.h>
 
@@ -26,6 +29,10 @@
 #include "motor-ws.h"
 #include "ws.h"
 #include "ws_token.h"
+
+#ifdef MOTORS_WS_TLS
+#include "ws_tls.h"
+#endif
 
 /* The only request target that upgrades. Anything else gets a 404, so the
  * port does not double as an accidental generic endpoint. */
@@ -91,7 +98,21 @@
  * ~11 commands/s and will never see a single strike. */
 #define WS_MAX_STRIKES 50
 
+/* Time a TLS peer gets to complete the cryptographic handshake, before the
+ * HTTP one even starts. Separate from WS_HANDSHAKE_TIMEOUT_MS and larger,
+ * because this budget covers an RSA/ECDHE key exchange on a ~1 GHz MIPS core
+ * with no crypto accelerator plus one or two client round trips - measured at
+ * a few hundred ms on real hardware, but a phone on weak WiFi is not that. */
+#define WS_TLS_HANDSHAKE_TIMEOUT_MS 15000
+
 static motor_ws_cfg g_cfg;
+
+#ifdef MOTORS_WS_TLS
+/* NULL when TLS is off, unavailable, or no certificate could be loaded. Set
+ * once in motor_ws_start() before the listener thread exists and never written
+ * again, so the connection threads read it without a lock. */
+static ws_tls_ctx *g_tls;
+#endif
 
 /* Live connection count, guarded by g_count_lock. A plain int + mutex rather
  * than an atomic builtin: this has to build on whatever the buildroot
@@ -108,7 +129,9 @@ static pthread_mutex_t g_home_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_home_running = false;
 
 typedef struct {
-  int fd;
+  /* Owns both members: conn_thread() closes the fd and frees any TLS session
+   * on every exit path. ws.c only borrows this. */
+  ws_io io;
   ws_conn ws;
   bool local; /* peer is in 127.0.0.0/8 */
   char peer[INET_ADDRSTRLEN];
@@ -147,6 +170,24 @@ static int clampi(int v, int lo, int hi) {
   return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
+#ifdef MOTORS_WS_TLS
+/* Wait for the socket to have at least one byte. Only used by the first-byte
+ * protocol sniff in conn_thread(); ws.c owns every other wait on this fd.
+ * Returns 0 when readable, -1 on timeout or error. */
+static int poll_fd_readable(int fd, int timeout_ms) {
+  struct pollfd p = {.fd = fd, .events = POLLIN, .revents = 0};
+  int r;
+
+  do {
+    r = poll(&p, 1, timeout_ms);
+  } while (r < 0 && errno == EINTR);
+
+  if (r <= 0)
+    return -1;
+  return (p.revents & (POLLERR | POLLNVAL)) ? -1 : 0;
+}
+#endif
+
 /* ------------------------------------------------------------------ *
  * outgoing JSON
  *
@@ -182,7 +223,7 @@ static int send_status(ws_client *c, const char *type,
   int n = fmt_status(buf, sizeof(buf), type, m);
   if (n < 0 || (size_t)n >= sizeof(buf))
     return WS_EIO;
-  return ws_send_text(c->fd, buf);
+  return ws_send_text(&c->io, buf);
 }
 
 static int send_error(ws_client *c, long long id, const char *code,
@@ -202,7 +243,7 @@ static int send_error(ws_client *c, long long id, const char *code,
 
   if (n < 0 || (size_t)n >= sizeof(buf))
     return WS_EIO;
-  return ws_send_text(c->fd, buf);
+  return ws_send_text(&c->io, buf);
 }
 
 static int send_ack(ws_client *c, long long id, const char *cmd, bool have_xy,
@@ -221,7 +262,7 @@ static int send_ack(ws_client *c, long long id, const char *cmd, bool have_xy,
 
   if (n < 0 || (size_t)n >= sizeof(buf))
     return WS_EIO;
-  return ws_send_text(c->fd, buf);
+  return ws_send_text(&c->io, buf);
 }
 
 /* ------------------------------------------------------------------ *
@@ -724,7 +765,7 @@ keepalive:
   if (ws_conn_idle_ms(&c->ws) >= WS_LIVENESS_TIMEOUT_MS) {
     syslog(LOG_INFO, "ws: %s silent for %ds, closing stale connection", c->peer,
            WS_LIVENESS_TIMEOUT_MS / 1000);
-    ws_send_close(c->fd, WS_CLOSE_GOING_AWAY, "keepalive timeout");
+    ws_send_close(&c->io, WS_CLOSE_GOING_AWAY, "keepalive timeout");
     /* WS_CLOSED, not WS_EIO: the socket is fine, we are the ones ending this.
      * conn_thread() treats every non-WS_OK the same, but the distinction is
      * worth keeping honest for anything that reads this later. */
@@ -732,7 +773,7 @@ keepalive:
   }
 
   if ((now - c->last_ping_ms) >= WS_PING_INTERVAL_MS) {
-    if (ws_send_ping(c->fd) != WS_OK)
+    if (ws_send_ping(&c->io) != WS_OK)
       return WS_EIO;
     c->last_ping_ms = now;
   }
@@ -758,23 +799,75 @@ static void *conn_thread(void *arg) {
    * this whole change exists to remove. */
   {
     int one = 1;
-    setsockopt(c->fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    setsockopt(c->fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
+    setsockopt(c->io.fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(c->io.fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
   }
 
-  rc = ws_handshake_read(c->fd, &hs, WS_HANDSHAKE_TIMEOUT_MS);
+  /* TLS, if this particular connection wants it.
+   *
+   * ws:// and wss:// share ONE port, chosen by sniffing the first byte the
+   * client sends rather than by configuration. 0x16 is the TLS record type
+   * "handshake", and a WebSocket client's first byte is always the 'G' of
+   * "GET" - the two cannot be confused, so the ambiguity that usually makes
+   * protocol sniffing a bad idea does not arise here.
+   *
+   * Sniffing rather than a second listener, or a config switch that picks one:
+   *
+   *  - It is what makes this change backward compatible. Cameras that serve
+   *    the WebUI over plain http:// keep working exactly as before even once
+   *    a certificate is present, which a TLS-only listener would break for
+   *    every one of them at once (self-signed wss:// from an http:// page is
+   *    not something a browser lets the user click through).
+   *  - The port is baked into json-motor-token.cgi, motors.ws_port and every
+   *    deployed page; a second port would need all of them to learn about it.
+   *  - A second listener would double the accept path and the config surface
+   *    to serve at most four clients.
+   *
+   * MSG_PEEK leaves the byte in the socket buffer, so whichever path is taken
+   * below reads the stream from its true beginning. */
+#ifdef MOTORS_WS_TLS
+  if (g_tls) {
+    unsigned char first = 0;
+    ssize_t pk;
+
+    /* Peek, but never block on it: an idle connection must be reclaimed by the
+     * handshake timeout, not park a thread here. */
+    if (poll_fd_readable(c->io.fd, WS_HANDSHAKE_TIMEOUT_MS) != 0) {
+      syslog(LOG_DEBUG, "ws: %s sent nothing, dropping", c->peer);
+      goto done;
+    }
+    do {
+      pk = recv(c->io.fd, &first, 1, MSG_PEEK);
+    } while (pk < 0 && errno == EINTR);
+    if (pk <= 0)
+      goto done;
+
+    if (first == 0x16) {
+      c->io.tls = ws_tls_accept(g_tls, c->io.fd, WS_TLS_HANDSHAKE_TIMEOUT_MS);
+      if (!c->io.tls) {
+        /* ws_tls_accept() has already logged whatever was worth logging, and
+         * rate-limited it. Nothing useful can be said back to the peer - it is
+         * expecting TLS records, so a plaintext HTTP error would be noise. */
+        goto done;
+      }
+      syslog(LOG_DEBUG, "ws: TLS established with %s", c->peer);
+    }
+  }
+#endif
+
+  rc = ws_handshake_read(&c->io, &hs, WS_HANDSHAKE_TIMEOUT_MS);
   if (rc != WS_OK) {
     syslog(LOG_DEBUG, "ws: handshake read failed from %s (rc=%d)", c->peer, rc);
     goto done;
   }
 
   if (strcmp(hs.path, WS_PATH) != 0) {
-    ws_handshake_reject(c->fd, 404, "Not Found", "not found\n");
+    ws_handshake_reject(&c->io, 404, "Not Found", "not found\n");
     goto done;
   }
 
   if (!ws_handshake_is_upgrade(&hs)) {
-    ws_handshake_reject(c->fd, 400, "Bad Request",
+    ws_handshake_reject(&c->io, 400, "Bad Request",
                         "expected a WebSocket version 13 upgrade\n");
     goto done;
   }
@@ -783,23 +876,23 @@ static void *conn_thread(void *arg) {
    * cross-site page gets the same 403 whether or not it guessed a token. */
   if (!origin_allowed(&hs)) {
     syslog(LOG_WARNING, "ws: rejected Origin '%s' from %s", hs.origin, c->peer);
-    ws_handshake_reject(c->fd, 403, "Forbidden", "origin not allowed\n");
+    ws_handshake_reject(&c->io, 403, "Forbidden", "origin not allowed\n");
     goto done;
   }
 
   if (!client_authorized(&hs, c->local)) {
     syslog(LOG_WARNING, "ws: unauthorized connection from %s", c->peer);
-    ws_handshake_reject(c->fd, 401, "Unauthorized", "token required\n");
+    ws_handshake_reject(&c->io, 401, "Unauthorized", "token required\n");
     goto done;
   }
 
-  if (ws_handshake_accept(c->fd, &hs, NULL) != WS_OK)
+  if (ws_handshake_accept(&c->io, &hs, NULL) != WS_OK)
     goto done;
 
   syslog(LOG_INFO, "ws: client connected from %s%s", c->peer,
          c->local ? " (loopback)" : "");
 
-  ws_conn_init(&c->ws, c->fd);
+  ws_conn_init(&c->ws, &c->io);
   c->tokens = (double)g_cfg.rate_limit;
   c->bucket_ms = now_ms();
   c->last_ping_ms = c->bucket_ms;
@@ -831,22 +924,22 @@ static void *conn_thread(void *arg) {
       continue;
     }
     if (rc == WS_CLOSED) {
-      ws_send_close(c->fd, WS_CLOSE_NORMAL, "bye");
+      ws_send_close(&c->io, WS_CLOSE_NORMAL, "bye");
       break;
     }
     if (rc == WS_ETOOBIG) {
-      ws_send_close(c->fd, WS_CLOSE_TOO_BIG, "frame too large");
+      ws_send_close(&c->io, WS_CLOSE_TOO_BIG, "frame too large");
       break;
     }
     if (rc == WS_EPROTO) {
-      ws_send_close(c->fd, WS_CLOSE_PROTOCOL, "protocol error");
+      ws_send_close(&c->io, WS_CLOSE_PROTOCOL, "protocol error");
       break;
     }
     if (rc != WS_OK)
       break;
 
     if (opcode != WS_OP_TEXT) {
-      ws_send_close(c->fd, WS_CLOSE_UNSUPPORTED, "text frames only");
+      ws_send_close(&c->io, WS_CLOSE_UNSUPPORTED, "text frames only");
       break;
     }
 
@@ -854,7 +947,7 @@ static void *conn_thread(void *arg) {
       if (++c->strikes > WS_MAX_STRIKES) {
         syslog(LOG_WARNING, "ws: %s exceeded the command rate limit, closing",
                c->peer);
-        ws_send_close(c->fd, WS_CLOSE_POLICY, "rate limit exceeded");
+        ws_send_close(&c->io, WS_CLOSE_POLICY, "rate limit exceeded");
         break;
       }
       if (send_error(c, -1, "rate_limited", "too many commands") != WS_OK)
@@ -877,7 +970,17 @@ static void *conn_thread(void *arg) {
   syslog(LOG_INFO, "ws: client %s disconnected", c->peer);
 
 done:
-  close(c->fd);
+  /* Order matters: close_notify has to go out over a socket that is still
+   * open, so the TLS session is torn down before the fd. Every exit path above
+   * reaches here, including the ones that jump past ws_tls_accept(), where
+   * io.tls is still NULL and this is a no-op. */
+#ifdef MOTORS_WS_TLS
+  if (c->io.tls) {
+    ws_tls_close((ws_tls_conn *)c->io.tls);
+    c->io.tls = NULL;
+  }
+#endif
+  close(c->io.fd);
   client_release();
   free(c);
   return NULL;
@@ -917,7 +1020,14 @@ static void *listen_thread(void *arg) {
        * at most a handful of legitimate PTZ viewers; anything past the cap
        * is either a bug or an attempt to exhaust thread stacks, and both are
        * best answered with a closed socket. */
-      ws_handshake_reject(fd, 503, "Service Unavailable",
+      /* Deliberately plaintext even on a build that can serve wss://. This
+       * refusal happens before any TLS handshake - running one just to say
+       * "no" would hand an attacker a way to make the daemon do public-key
+       * work on demand, which is the opposite of what a connection cap is
+       * for. A wss:// client sees the connection close instead of reading the
+       * 503, and closing IS the message. */
+      ws_io rej = {.fd = fd, .tls = NULL};
+      ws_handshake_reject(&rej, 503, "Service Unavailable",
                           "too many clients\n");
       close(fd);
       syslog(LOG_WARNING, "ws: connection limit (%d) reached, rejecting %s",
@@ -932,7 +1042,9 @@ static void *listen_thread(void *arg) {
       continue;
     }
 
-    c->fd = fd;
+    /* calloc() already zeroed io.tls; conn_thread() fills it in if this turns
+     * out to be a TLS client. */
+    c->io.fd = fd;
     c->local = ws_addr_is_loopback(ntohl(peer.sin_addr.s_addr));
     inet_ntop(AF_INET, &peer.sin_addr, c->peer, sizeof(c->peer));
     c->push_ms = 0;
@@ -978,7 +1090,154 @@ void motor_ws_cfg_defaults(motor_ws_cfg *cfg) {
   cfg->max_clients = 4;
   cfg->rate_limit = 25; /* the UI's hold loop runs at ~11/s */
   cfg->push_ms = 150;
+  /* Enabled, but that only means "serve wss:// IF a certificate turns up".
+   * Empty paths mean "probe the usual places" - see resolve_tls_paths(). A
+   * camera with no certificate is unaffected by this default in every
+   * observable way. */
+  cfg->tls_enabled = true;
+  cfg->tls_cert[0] = '\0';
+  cfg->tls_key[0] = '\0';
 }
+
+#ifdef MOTORS_WS_TLS
+/* Where to look for a certificate when motors.ws_tls_cert/ws_tls_key are not
+ * set, in order.
+ *
+ * This daemon never GENERATES a certificate - it only ever reads one that
+ * something else on the image already produced. That is the whole reason this
+ * resolution can live here in C at all, rather than in the init script the way
+ * timps's has to: S95timps has to decide where to generate INTO, so its
+ * decision cannot be made by a daemon that starts later. Ours is only ever
+ * "which existing file", so "the first of these that is there" is a complete
+ * answer, and there is exactly one certificate policy on the camera - S95timps
+ * owns it, everyone else points at the result.
+ *
+ * [0] is that result. ensure_tls_certs() in S95timps either symlinks these two
+ * paths at the WebUI's uhttpd pair, or (on an image with no WebUI) generates a
+ * self-signed pair here - so whichever the platform decided, it is already
+ * sitting at these paths, and using them is how motors inherits that decision
+ * without re-implementing it.
+ *
+ * [1] is the WebUI's own pair, and it is not redundant. Three real cases reach
+ * it, none of which involve minting anything:
+ *
+ *  - Boot order. S02ssl writes the uhttpd pair, then S59motor (this daemon)
+ *    runs, then S95timps creates [0]. On the FIRST boot after a flash, [0]
+ *    therefore does not exist yet when we look. It persists across later
+ *    reboots because /etc is on the overlay, so this window is first-boot
+ *    only - but "wss:// works from the second boot onward" is not a behaviour
+ *    worth shipping when the fallback is the very file [0] would have pointed
+ *    at anyway.
+ *  - timps with TLS off. ensure_tls_certs() returns early unless timps's own
+ *    http.https or rtsp.tls is set, so on a camera whose WebUI is https but
+ *    whose timps is plain, [0] is never created at all - while the page doing
+ *    the PTZ is still https and still needs wss://.
+ *  - Images with the WebUI but no timps package.
+ *
+ * On any image that has the WebUI, [0] and [1] resolve to the SAME
+ * certificate; [1] just does not depend on S95timps having run to say so.
+ *
+ * Why it must be the web UI's certificate and not one of our own: a browser
+ * tracks trust for a self-signed certificate per origin - scheme+host+PORT -
+ * so :443 and :8089 are two separate trust decisions on one camera. The user
+ * clicks through the warning once, on a top-level navigation to the WebUI; a
+ * WebSocket gets no such prompt (iOS Safari offers none at all) and would
+ * simply fail. Presenting the identical certificate makes the one trust
+ * decision cover both ports. That is the same reasoning, and the same
+ * certificate, as the comment above ensure_tls_certs() in S95timps.
+ *
+ * If none of them is there, TLS stays off and the listener serves plain
+ * ws:// - see tls_init(). */
+static const char *const g_tls_candidates[][2] = {
+    {"/etc/ssl/certs/timps.crt", "/etc/ssl/private/timps.key"},
+    {"/etc/ssl/certs/uhttpd.crt", "/etc/ssl/private/uhttpd.key"},
+};
+
+static bool file_is_usable(const char *path) {
+  struct stat st;
+  /* stat() rather than access(): a DANGLING symlink is the expected failure
+   * here (S95timps links timps.crt at uhttpd.crt, and an image without uhttpd
+   * leaves that link pointing at nothing), and stat() follows the link and
+   * says no, where a bare existence check on the link itself would say yes.
+   * Size, too - an interrupted certgen leaves an empty file that would only
+   * fail later, inside mbedTLS. */
+  return stat(path, &st) == 0 && S_ISREG(st.st_mode) && st.st_size > 0;
+}
+
+/* Fills cert/key with the pair to use, or returns false if there is none. */
+static bool resolve_tls_paths(const char **cert, const char **key) {
+  size_t i;
+
+  if (g_cfg.tls_cert[0] && g_cfg.tls_key[0]) {
+    /* Explicitly configured: use it or fail, never silently fall back to
+     * something else. An operator who named a certificate wants to know it is
+     * missing, not to get a different one. */
+    *cert = g_cfg.tls_cert;
+    *key = g_cfg.tls_key;
+    return true;
+  }
+  if (g_cfg.tls_cert[0] || g_cfg.tls_key[0]) {
+    syslog(LOG_WARNING,
+           "ws: motors.ws_tls_cert and ws_tls_key must be set together; "
+           "ignoring the one that is set");
+  }
+
+  for (i = 0; i < sizeof(g_tls_candidates) / sizeof(g_tls_candidates[0]); i++) {
+    if (file_is_usable(g_tls_candidates[i][0]) &&
+        file_is_usable(g_tls_candidates[i][1])) {
+      *cert = g_tls_candidates[i][0];
+      *key = g_tls_candidates[i][1];
+      return true;
+    }
+  }
+  return false;
+}
+
+/* Publish whether wss:// is actually available, for json-motor-token.cgi.
+ * Best effort in both directions: a camera whose /run is somehow unwritable
+ * still serves TLS fine, the page just does not learn about it and stays on
+ * the CGI path - which is the same place it would have been anyway. */
+static void publish_tls_flag(bool on) {
+  if (!on) {
+    unlink(MOTOR_WS_TLS_FLAG_FILE);
+    return;
+  }
+  {
+    int fd = open(MOTOR_WS_TLS_FLAG_FILE, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0)
+      close(fd);
+  }
+}
+
+/* Load the certificate, or decide to live without one. Never fails the
+ * listener: plain ws:// is the fallback for every problem here, and it is
+ * exactly what this daemon served before wss:// existed. */
+static void tls_init(void) {
+  const char *cert = NULL, *key = NULL;
+
+  if (!g_cfg.tls_enabled) {
+    syslog(LOG_INFO, "ws: TLS disabled by motors.ws_tls");
+    publish_tls_flag(false);
+    return;
+  }
+  if (!resolve_tls_paths(&cert, &key)) {
+    syslog(LOG_INFO, "ws: no TLS certificate found, serving plain ws:// only");
+    publish_tls_flag(false);
+    return;
+  }
+
+  g_tls = ws_tls_ctx_new(cert, key);
+  if (!g_tls) {
+    /* ws_tls_ctx_new() logged the specific reason at LOG_ERR. */
+    syslog(LOG_WARNING, "ws: TLS setup failed, serving plain ws:// only");
+    publish_tls_flag(false);
+    return;
+  }
+
+  syslog(LOG_INFO, "ws: wss:// enabled using %s", cert);
+  publish_tls_flag(true);
+}
+#endif /* MOTORS_WS_TLS */
 
 int motor_ws_start(motor_ws_cfg *cfg) {
   struct sockaddr_in addr;
@@ -1033,27 +1292,47 @@ int motor_ws_start(motor_ws_cfg *cfg) {
     return -1;
   }
 
+  /* TLS.
+   *
+   * Before the listener thread exists, because the connection threads it
+   * spawns read g_tls with no lock - this is the only writer, and it has to be
+   * finished before any reader can run.
+   *
+   * The listener used to be plain ws:// only, on the reasoning that the LAN is
+   * this firmware's accepted trust boundary. What changed is not the threat
+   * model but the browser's: once the WebUI is served over https://, a plain
+   * ws:// connection from that page is blocked as mixed content, and the PTZ
+   * panel silently falls back to one CGI round trip per command - which is the
+   * exact cost this whole frontend exists to remove. So wss:// is not a
+   * hardening measure here, it is what keeps the fast path reachable. */
+#ifdef MOTORS_WS_TLS
+  tls_init();
+#endif
+
   if (pthread_create(&tid, NULL, listen_thread, (void *)(long)lfd) != 0) {
     syslog(LOG_ERR, "ws: cannot spawn listener thread");
     close(lfd);
+#ifdef MOTORS_WS_TLS
+    if (g_tls) {
+      ws_tls_ctx_free(g_tls);
+      g_tls = NULL;
+    }
+    publish_tls_flag(false);
+#endif
     return -1;
   }
   pthread_detach(tid);
 
-  /* TLS.
-   *
-   * This listener is plain ws:// on purpose, matching the rest of this
-   * firmware's posture (the LAN is the accepted trust boundary; TLS is
-   * opt-in and configured per service). Adding wss:// would mean wrapping
-   * exactly one seam: the accepted fd in conn_thread() above, before
-   * ws_handshake_read(), with the socket reads/writes in ws.c routed through
-   * the TLS context instead of read()/send(). thingino-motors has no TLS
-   * dependency today - it links libjct and nothing else - so that would be a
-   * new one; the library the rest of this firmware family already carries is
-   * mbedTLS (the sibling timps project uses it in src/tls.c, and reuses
-   * thingino's httpd certificate rather than minting its own). Do not
-   * hand-roll it. */
-
+#ifdef MOTORS_WS_TLS
+  if (g_tls) {
+    syslog(LOG_INFO,
+           "ws: listening on ws:// and wss://%s:%d%s (max %d clients, %d "
+           "cmd/s)",
+           g_cfg.bind_addr, g_cfg.port, WS_PATH, g_cfg.max_clients,
+           g_cfg.rate_limit);
+    return 0;
+  }
+#endif
   syslog(LOG_INFO, "ws: listening on ws://%s:%d%s (max %d clients, %d cmd/s)",
          g_cfg.bind_addr, g_cfg.port, WS_PATH, g_cfg.max_clients,
          g_cfg.rate_limit);

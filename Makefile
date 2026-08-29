@@ -66,20 +66,40 @@ BINARIES := motor motor-daemon
 # makes that impossible.
 WS       ?= 1
 
+# wss:// (WS_TLS=1). Off by default because it is the one thing in this tree
+# with a dependency beyond libjct - mbedTLS - and `make` on a bare development
+# host must keep working without it. The thingino package turns it on from its
+# own Kconfig option (BR2_PACKAGE_THINGINO_MOTORS_WS_TLS), where the dependency
+# is declared and therefore guaranteed present.
+#
+# WS=0 WS_TLS=1 is not a configuration: without the listener there is nothing
+# to wrap, so the nesting below silently ignores it rather than half-building.
+WS_TLS   ?= 0
+
 ifeq ($(WS),0)
 WS_OBJS  :=
 WS_DEFS  :=
+WS_LIBS  :=
 else
 WS_OBJS  := $(SRC_DIR)/sha1.o $(SRC_DIR)/sha256.o $(SRC_DIR)/ws.o \
             $(SRC_DIR)/ws_token.o $(SRC_DIR)/motor-ws.o
 WS_DEFS  := -DMOTORS_WS
+WS_LIBS  :=
+ifeq ($(WS_TLS),1)
+WS_OBJS  += $(SRC_DIR)/ws_tls.o
+WS_DEFS  += -DMOTORS_WS_TLS
+# x509 and crypto explicitly, not just -lmbedtls: certificate parsing and the
+# DRBG live in the other two, and a static or --as-needed link will not pull
+# them in transitively.
+WS_LIBS  := -lmbedtls -lmbedx509 -lmbedcrypto
+endif
 endif
 
 OBJS     := $(SRC_DIR)/motor.o $(SRC_DIR)/motor-daemon.o $(WS_OBJS)
 
 # The daemon is threaded (async move workers, and now the WS listener and one
 # thread per WS client), and motor-daemon.c uses libm.
-DAEMON_LIBS := -lpthread -lm
+DAEMON_LIBS := -lpthread -lm $(WS_LIBS)
 
 .PHONY: all deps clean distclean format selftest check
 
