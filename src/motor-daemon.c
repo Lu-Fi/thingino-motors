@@ -2251,7 +2251,7 @@ static void daemonsetup() {
    * lands on a socket the peer already reset - silently, since SIGPIPE writes
    * nothing to syslog and dumps no core. ws.c's plaintext writes pass
    * MSG_NOSIGNAL, but the wss:// path writes through mbedTLS's own BIO
-   * (mbedtls_net_send(), a bare send() with no flags), and mbedTLS only
+   * (a bare write(), which can't take flags at all), and mbedTLS only
    * installs its SIGPIPE guard inside net_prepare(), which runs from
    * mbedtls_net_bind()/_connect() - neither of which ws_tls_accept() uses, as
    * it wraps a socket motor-ws.c accepted itself. Same reason and same
