@@ -140,7 +140,9 @@ static ssize_t io_write(ws_io *io, const void *buf, size_t n) {
   /* MSG_NOSIGNAL: a PTZ client that closes its tab mid-push must not take the
    * whole daemon down with SIGPIPE. The AF_UNIX path never had to care because
    * it wrote at most one struct to a client that was still blocking on read().
-   * The TLS branch above gets the same protection from ws_tls.c's BIO. */
+   * The TLS branch above canNOT be covered here - it writes through mbedTLS's
+   * BIO, which passes no flags - so the daemon ignores SIGPIPE globally
+   * instead; see the signal() call in motor-daemon.c's daemonsetup(). */
   return send(io->fd, buf, n, MSG_NOSIGNAL);
 }
 

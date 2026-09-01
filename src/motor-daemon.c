@@ -2247,6 +2247,16 @@ static void daemonsetup() {
   // TODO: Implement a working signal handler */
   signal(SIGCHLD, SIG_IGN);
   signal(SIGHUP, SIG_IGN);
+  /* SIGPIPE would otherwise kill the daemon outright the first time a write
+   * lands on a socket the peer already reset - silently, since SIGPIPE writes
+   * nothing to syslog and dumps no core. ws.c's plaintext writes pass
+   * MSG_NOSIGNAL, but the wss:// path writes through mbedTLS's own BIO
+   * (mbedtls_net_send(), a bare send() with no flags), and mbedTLS only
+   * installs its SIGPIPE guard inside net_prepare(), which runs from
+   * mbedtls_net_bind()/_connect() - neither of which ws_tls_accept() uses, as
+   * it wraps a socket motor-ws.c accepted itself. Same reason and same
+   * one-liner as timps's main.c. */
+  signal(SIGPIPE, SIG_IGN);
 
   /* Fork off for the second time*/
   pid = fork();
