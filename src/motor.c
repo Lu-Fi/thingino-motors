@@ -18,6 +18,12 @@
 #include <sys/types.h>
 #include <sys/un.h>
 
+// Set on the compile command line by the Buildroot package; the fallback
+// keeps a standalone build of this tree compiling.
+#ifndef MOTORS_BUILD_VERSION
+#define MOTORS_BUILD_VERSION "unknown"
+#endif
+
 // Lightweight config for client (useful for default speed)
 typedef struct {
   int max_steps;
@@ -185,6 +191,7 @@ static void print_json_message(struct motor_message *message,
   }
   printf(",\"speed\":\"%d\"", message->speed);
   printf(",\"invert\":\"%d\"", message->inversion_state);
+  printf(",\"version\":\"%s\"", MOTORS_BUILD_VERSION);
   printf("}\n");
 }
 
@@ -275,6 +282,15 @@ int main(int argc, char *argv[]) {
   struct request request_message;
   bool verbose = false; // Initialize verbose to false
   bool has_command = false;
+
+  // Answered before the daemon-alive check below, so the version is readable
+  // on a camera whose daemon is down. -v is already taken by verbose mode.
+  for (int i = 1; i < argc; i++) {
+    if (!strcmp(argv[i], "--version") || !strcmp(argv[i], "-V")) {
+      printf("%s\n", MOTORS_BUILD_VERSION);
+      return 0;
+    }
+  }
 
   initialize_request_message(&request_message);
 
@@ -531,7 +547,8 @@ int main(int argc, char *argv[]) {
           "\t -S show status\n"
           "\t -I Invert motor direction with 'x', 'y', or 'b' for both axes\n"
           "\t -R reload daemon config from /etc/thingino.json (invert_x/"
-          "invert_y, speeds, accel, timeouts, pos_0) without restarting\n",
+          "invert_y, speeds, accel, timeouts, pos_0) without restarting\n"
+          "\t -V, --version print the build version and exit\n",
           argv[0]);
       exit(EXIT_FAILURE);
     }
