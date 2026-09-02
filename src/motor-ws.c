@@ -958,10 +958,14 @@ static void *conn_thread(void *arg) {
     if (handle_command(c, (const char *)msg) != WS_OK)
       break;
 
-    /* A command almost always moves something; force the next periodic()
-     * to sample and send rather than waiting out a full interval. */
+    /* A command almost always moves something; force the next periodic() to
+     * SAMPLE now rather than waiting out a full interval. Only last_poll_ms:
+     * zeroing last_sent_ms too would also force the frame out, defeating
+     * periodic()'s change detection for the commands that changed nothing -
+     * a ping, a move clamped to zero, a vector update against a travel limit
+     * the camera is already parked on. Every command already answers with its
+     * own ack or error, so there is no reply owed here. */
     c->last_poll_ms = 0;
-    c->last_sent_ms = 0;
 
     if (periodic(c) != WS_OK)
       break;
