@@ -1328,6 +1328,33 @@ static int run_profiled_move(int xsteps, int ysteps, int requested_speed,
   return motion_is_cancelled(generation) ? -1 : 0;
 }
 
+/* Spawn a detached worker on a bounded 64 KB stack, the same convention the
+ * WS listener uses for its connection threads (see spawn_detached() in
+ * motor-ws.c). Nothing joins these. 64 KB is ample: the deepest chain from
+ * here is run_profiled_move -> execute_profile_phase -> motor_steps_impl,
+ * every frame a handful of scalars, measured at well under 1 KB in total. It
+ * matters because a held joystick button dispatches ~11 moves a second, each
+ * one a thread create+destroy, and the pthread default reserves megabytes of
+ * address space for each. Returns 0 on success, -1 on failure. */
+static int spawn_detached_worker(void *(*fn)(void *), void *arg) {
+  pthread_t tid;
+  pthread_attr_t attr;
+  pthread_attr_t *attrp = NULL;
+  int err;
+
+  if (pthread_attr_init(&attr) == 0) {
+    pthread_attr_setstacksize(&attr, 64 * 1024);
+    attrp = &attr;
+  }
+  err = pthread_create(&tid, attrp, fn, arg);
+  if (attrp)
+    pthread_attr_destroy(attrp);
+  if (err != 0)
+    return -1;
+  pthread_detach(tid);
+  return 0;
+}
+
 static void *async_move_worker(void *arg) {
   struct async_move *move = (struct async_move *)arg;
 
@@ -1344,7 +1371,6 @@ static void *async_move_worker(void *arg) {
 }
 
 static int start_profiled_move_async(int xsteps, int ysteps, int speed) {
-  pthread_t tid;
   struct async_move *move = NULL;
 
   // For rapid UI nudges, avoid hard-stopping on every new command.
@@ -1360,12 +1386,11 @@ static int start_profiled_move_async(int xsteps, int ysteps, int speed) {
   move->speed = speed;
   move->generation = motion_begin_new();
 
-  if (pthread_create(&tid, NULL, async_move_worker, move) != 0) {
+  if (spawn_detached_worker(async_move_worker, move) != 0) {
     free(move);
     return -1;
   }
 
-  pthread_detach(tid);
   return 0;
 }
 
@@ -2219,10 +2244,7 @@ static void *motion_active_tracker(void *arg) {
 
 static void start_motion_active_tracker() {
   write_motion_active_flag();
-  pthread_t tid;
-  if (pthread_create(&tid, NULL, motion_active_tracker, NULL) == 0) {
-    pthread_detach(tid);
-  }
+  (void)spawn_detached_worker(motion_active_tracker, NULL);
 }
 
 static void daemonsetup() {

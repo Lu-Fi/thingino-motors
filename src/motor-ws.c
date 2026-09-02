@@ -170,6 +170,34 @@ static int clampi(int v, int lo, int hi) {
   return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
+/* Spawn a detached worker on a bounded stack. Nothing here is ever joined -
+ * neither a connection thread nor a homing run - so detached is the shape.
+ *
+ * 64 KB because the deepest frame in this file is a connection thread's
+ * handshake struct (~3.5 KB) plus one frame buffer; the pthread default would
+ * be megabytes of address space per client, which is the wrong shape for a
+ * device with 64 MB of RAM and a connection cap that exists specifically to
+ * bound resource use. If the attribute cannot be set up, fall back to the
+ * default rather than refusing the work. Returns 0 on success, -1 on failure. */
+static int spawn_detached(void *(*fn)(void *), void *arg) {
+  pthread_t tid;
+  pthread_attr_t attr;
+  pthread_attr_t *attrp = NULL;
+  int err;
+
+  if (pthread_attr_init(&attr) == 0) {
+    pthread_attr_setstacksize(&attr, 64 * 1024);
+    attrp = &attr;
+  }
+  err = pthread_create(&tid, attrp, fn, arg);
+  if (attrp)
+    pthread_attr_destroy(attrp);
+  if (err != 0)
+    return -1;
+  pthread_detach(tid);
+  return 0;
+}
+
 #ifdef MOTORS_WS_TLS
 /* Wait for the socket to have at least one byte. Only used by the first-byte
  * protocol sniff in conn_thread(); ws.c owns every other wait on this fd.
@@ -610,7 +638,6 @@ static int handle_command(ws_client *c, const char *text) {
     motor_ctl_stop();
     rc = send_ack(c, id, "stop", false, 0, 0);
   } else if (strcmp(cmd, "home") == 0) {
-    pthread_t tid;
     bool started = false;
     int eff_speed = motor_ctl_resolve_speed(speed);
 
@@ -629,14 +656,13 @@ static int handle_command(ws_client *c, const char *text) {
     /* Detached, because motor_ctl_home() is synchronous and can run for tens
      * of seconds; parking this connection thread on it would make "stop"
      * unreachable from the very client that started the home. */
-    if (pthread_create(&tid, NULL, home_worker, (void *)(long)eff_speed) != 0) {
+    if (spawn_detached(home_worker, (void *)(long)eff_speed) != 0) {
       pthread_mutex_lock(&g_home_lock);
       g_home_running = false;
       pthread_mutex_unlock(&g_home_lock);
       rc = send_error(c, id, "internal", "cannot start homing thread");
       goto out;
     }
-    pthread_detach(tid);
     rc = send_ack(c, id, "home", false, 0, 0);
   } else if (strcmp(cmd, "speed") == 0) {
     if (speed <= 0) {
@@ -1053,32 +1079,13 @@ static void *listen_thread(void *arg) {
     inet_ntop(AF_INET, &peer.sin_addr, c->peer, sizeof(c->peer));
     c->push_ms = 0;
 
-    /* Bounded stack. A connection thread's deepest frame is the handshake
-     * struct (~3.5 KB) plus one frame buffer, so 64 KB is generous; the
-     * default would be megabytes of address space per client, which is the
-     * wrong shape for a device with 64 MB of RAM and a connection cap that
-     * exists specifically to bound resource use. If the attribute cannot be
-     * set up, fall back to the default rather than refusing the client. */
-    pthread_t tid;
-    pthread_attr_t attr;
-    pthread_attr_t *attrp = NULL;
-    if (pthread_attr_init(&attr) == 0) {
-      pthread_attr_setstacksize(&attr, 64 * 1024);
-      attrp = &attr;
-    }
-    int perr = pthread_create(&tid, attrp, conn_thread, c);
-    if (attrp)
-      pthread_attr_destroy(attrp);
-    if (perr != 0) {
+    if (spawn_detached(conn_thread, c) != 0) {
       syslog(LOG_ERR, "ws: cannot spawn connection thread");
       close(fd);
       client_release();
       free(c);
       continue;
     }
-    /* Detached, matching this daemon's existing pattern for the async move
-     * workers - nothing ever joins a per-request thread here. */
-    pthread_detach(tid);
   }
 
   close(lfd);
