@@ -317,11 +317,47 @@ static void test_frames(void) {
   /* a server frame must go out unmasked with the right header shape */
   if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
     unsigned char hdr[4];
+    unsigned char body[8];
     ws_send_text(test_io_for(sp[0]), "hello");
     if (read(sp[1], hdr, 2) == 2) {
       check_int("server frame FIN+TEXT", hdr[0], 0x81);
       check_int("server frame unmasked, len 5", hdr[1], 5);
     }
+    if (read(sp[1], body, 5) == 5) {
+      body[5] = '\0';
+      check_str("server frame payload", (const char *)body, "hello");
+    }
+    close(sp[0]);
+    close(sp[1]);
+  }
+
+  /* ws_send_frame() coalesces header+payload into a single write below a size
+   * threshold and falls back to two writes above it. Both shapes have to put
+   * the same bytes on the wire, so the large one is exercised here too - in
+   * the daemon itself only an echoed PONG can reach that branch. */
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0) {
+    unsigned char big[600];
+    unsigned char back[600];
+    unsigned char hdr[4];
+    size_t got = 0;
+
+    for (size_t i = 0; i < sizeof(big); i++)
+      big[i] = (unsigned char)(i * 7 + 1); /* never 0 - this is a text payload */
+    ws_send_frame(test_io_for(sp[0]), WS_OP_TEXT, big, sizeof(big));
+    if (read(sp[1], hdr, 4) == 4) {
+      check_int("large frame FIN+TEXT", hdr[0], 0x81);
+      check_int("large frame uses the 16-bit length", hdr[1], 126);
+      check_int("large frame length high byte", hdr[2], sizeof(big) >> 8);
+      check_int("large frame length low byte", hdr[3], sizeof(big) & 0xFF);
+    }
+    while (got < sizeof(back)) {
+      ssize_t r = read(sp[1], back + got, sizeof(back) - got);
+      if (r <= 0)
+        break;
+      got += (size_t)r;
+    }
+    check_int("large frame payload fully written", (int)got, (int)sizeof(big));
+    check_int("large frame payload intact", memcmp(back, big, sizeof(big)), 0);
     close(sp[0]);
     close(sp[1]);
   }

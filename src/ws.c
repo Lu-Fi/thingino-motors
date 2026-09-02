@@ -493,6 +493,15 @@ int ws_handshake_reject(ws_io *io, int status, const char *status_text,
  * frames
  * ------------------------------------------------------------------ */
 
+/* Header+payload for a frame this size are coalesced into one write_all().
+ * Every frame the daemon originates is well under it: the status/ack/error
+ * JSON is built in a 256-byte buffer, a close payload is capped at 125 by the
+ * RFC, a ping carries nothing. Two writes meant two syscalls and - worse over
+ * wss:// - two mbedTLS records, each with its own header/MAC/padding, for what
+ * is one small JSON object. Only an echoed PONG can exceed this (a peer may
+ * ping with up to WS_MAX_PAYLOAD), and that path keeps the split writes. */
+#define WS_COALESCE_MAX 512
+
 int ws_send_frame(ws_io *io, int opcode, const void *payload, size_t len) {
   unsigned char hdr[10];
   size_t hlen = 0;
@@ -514,6 +523,14 @@ int ws_send_frame(ws_io *io, int opcode, const void *payload, size_t len) {
     for (int i = 0; i < 8; i++)
       hdr[2 + i] = (unsigned char)((uint64_t)len >> (56 - 8 * i));
     hlen = 10;
+  }
+
+  if (len <= WS_COALESCE_MAX) {
+    unsigned char frame[sizeof(hdr) + WS_COALESCE_MAX];
+    memcpy(frame, hdr, hlen);
+    if (len > 0)
+      memcpy(frame + hlen, payload, len);
+    return write_all(io, frame, hlen + len);
   }
 
   if (write_all(io, hdr, hlen) != WS_OK)
