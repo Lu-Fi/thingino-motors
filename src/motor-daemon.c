@@ -359,27 +359,34 @@ static bool parse_modern_layout(JsonValue *root, JsonValue *motors) {
     g_cfg.hw.gpio_invert = bool_value;
     parsed = true;
   }
+  if (json_get_bool_jct(motors, "is_spi", &bool_value)) {
+    g_cfg.hw.is_spi = bool_value;
+    parsed = true;
+  }
   // Apply config-time axis inversion (invert_x / invert_y from thingino.json).
   // load_config_file() zeroes motor_inversion_state before calling here, so
   // these XORs act as an idempotent set; runtime "motors -I" IPC toggles then
   // XOR on top until the next reload/restart.
+  //
+  // On the SPI driver, invert_x/invert_y are ALSO passed as real kernel
+  // module params (S59motor, only when is_spi) - the driver already flips
+  // the physical direction there. XOR-ing the same flag into our own
+  // userspace state on top would invert it a second time and cancel out,
+  // leaving the config value with no net effect. Skip the userspace XOR for
+  // SPI boards; the module param is authoritative there.
   bool invert_x = false, invert_y = false;
   if (json_get_bool_jct(motors, "invert_x", &invert_x)) {
-    if (invert_x)
+    if (invert_x && !g_cfg.hw.is_spi)
       motor_inversion_state ^= MOTOR_INVERT_X;
     parsed = true;
   }
   if (json_get_bool_jct(motors, "invert_y", &invert_y)) {
-    if (invert_y)
+    if (invert_y && !g_cfg.hw.is_spi)
       motor_inversion_state ^= MOTOR_INVERT_Y;
     parsed = true;
   }
   if (json_get_bool_jct(motors, "homing", &bool_value)) {
     g_cfg.hw.homing = bool_value;
-    parsed = true;
-  }
-  if (json_get_bool_jct(motors, "is_spi", &bool_value)) {
-    g_cfg.hw.is_spi = bool_value;
     parsed = true;
   }
   bool limitless_value = false;
