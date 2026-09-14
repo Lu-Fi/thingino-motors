@@ -186,7 +186,10 @@ int ws_handshake_reject(ws_io *io, int status, const char *status_text,
  * Control frames are handled internally: PING is answered with PONG, PONG is
  * swallowed, CLOSE returns WS_CLOSED. The function therefore only ever hands
  * back TEXT or BIN, and the caller never has to think about the control
- * plane. timeout_ms bounds the total wait; WS_AGAIN means "nothing arrived",
+ * plane. timeout_ms bounds the wait for a message to BEGIN, not the wait for
+ * one to finish: once a header has been read, assembling the rest gets its own
+ * bounded budget, so a caller polling at 150 ms cannot tear a frame in half
+ * merely by having asked for a short poll. WS_AGAIN means "nothing arrived",
  * which is the caller's cue to do its periodic work (status push, keepalive).
  */
 int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,

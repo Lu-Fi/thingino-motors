@@ -29,6 +29,12 @@
 /* RFC 6455 section 1.3. Fixed by the spec, not a secret, not a salt. */
 #define WS_GUID "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
+/* How long the rest of a message may take once its first header byte has
+ * arrived. Generous against a slow link carrying a 2 KB frame, and short enough
+ * that a peer which stops mid-frame is reclaimed well inside the liveness
+ * deadline the frontend enforces between calls. See ws_read_message(). */
+#define WS_ASSEMBLY_TIMEOUT_MS 2000
+
 /* ------------------------------------------------------------------ *
  * clock
  * ------------------------------------------------------------------ */
@@ -562,16 +568,39 @@ int ws_send_close(ws_io *io, int code, const char *reason) {
 
 int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
                     size_t *out_len, int timeout_ms) {
-  /* One deadline for the whole message, as this function's contract in ws.h
-   * promises: every read below shares it, so a peer cannot park this thread by
-   * feeding a fragmented message one byte at a time. */
+  /* timeout_ms bounds the wait for a message to START. It must NOT also bound
+   * the reads that assemble one, and that distinction is the whole of the
+   * contract in ws.h.
+   *
+   * Sharing one deadline across both tore frames that were never torn. The
+   * caller's timeout is a polling cadence - 150 ms for a subscribed client,
+   * 1000 ms for one that only sends commands - so a frame whose header lands in
+   * the last fraction of that window leaves nothing on the clock for the mask
+   * and payload already sitting behind it in the same socket buffer.
+   * read_exact() refuses to look, reports the expiry, and the caller tears down
+   * a healthy connection. Being a race against a cadence rather than against
+   * load, it needs no traffic to happen and no amount of traffic to guarantee
+   * it: a client sending roughly once per read window - an unsubscribed PTZ
+   * client between gestures - hit it in 16 of 40 sessions on real hardware.
+   *
+   * So the budget switches once, the moment a header is in hand, to a bound on
+   * assembling the rest. Still a bound, and still one for the WHOLE message
+   * including any continuation frames, so a slow-loris peer gains at most
+   * WS_ASSEMBLY_TIMEOUT_MS and cannot reset the clock by dribbling - the switch
+   * happens once per call, not once per frame. */
   long long deadline = ws_now_ms() + timeout_ms;
+  bool assembling = false;
 
   for (;;) {
     unsigned char h[2];
     int rc = read_exact(c->io, h, 2, deadline);
     if (rc != WS_OK)
       return rc; /* WS_AGAIN here is benign: no frame had started */
+
+    if (!assembling) {
+      assembling = true;
+      deadline = ws_now_ms() + WS_ASSEMBLY_TIMEOUT_MS;
+    }
 
     bool fin = (h[0] & 0x80) != 0;
     int rsv = h[0] & 0x70;
