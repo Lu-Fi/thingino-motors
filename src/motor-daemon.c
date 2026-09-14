@@ -836,9 +836,30 @@ static bool uses_shared_motor_data_channel(void) {
   return false;
 }
 
+// Only one thread may be inside MOTOR_STOP at a time.
+//
+// The driver's motor_ops_stop() (ingenic-sdk misc/motor/motor.c) sets
+// wait_stop and blocks on stop_completion; the stepping ISR calls complete()
+// exactly once when the motors park. complete() releases ONE waiter. With the
+// stop thread and the move thread (stop_first) both in the ioctl - a release
+// followed within the ~100 ms parking window by a push in a new direction -
+// the second waiter is never signalled and sits out the driver's full 15 s
+// timeout. On the move thread that is 15 s of dead PTZ with every command
+// still acked; on the stop thread it is a release the camera ignores.
+// Serialised, the second caller waits for the first ioctl to return (the
+// hardware has parked by then), and its own ioctl takes the driver's early
+// dev_state == MOTOR_OPS_STOP exit.
+static pthread_mutex_t stop_ioctl_lock = PTHREAD_MUTEX_INITIALIZER;
+
 void motor_ioctl(int cmd, void *arg) {
   // basically exists to not pass around the motor FD
-  int ret = ioctl(motorfd, cmd, arg);
+  int ret;
+
+  if (cmd == MOTOR_STOP)
+    pthread_mutex_lock(&stop_ioctl_lock);
+  ret = ioctl(motorfd, cmd, arg);
+  if (cmd == MOTOR_STOP)
+    pthread_mutex_unlock(&stop_ioctl_lock);
   if (ret == -1) {
     syslog(LOG_ERR, "ioctl cmd 0x%x failed: %s", cmd, strerror(errno));
   }
