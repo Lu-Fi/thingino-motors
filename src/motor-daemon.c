@@ -767,6 +767,10 @@ struct async_move {
   int y_steps;
   int speed;
   unsigned int generation;
+  // Issue MOTOR_STOP from the worker, before the move. A stepper reversal
+  // needs the stop, but MOTOR_STOP blocks (see request_motor_stop()), so it
+  // has to happen here rather than on the frontend thread that asked for it.
+  bool stop_first;
 };
 
 int motorfd = -1;
@@ -778,7 +782,9 @@ static unsigned int motion_generation = 0;
 static bool motion_cancelled = false;
 
 // Forward declaration used by motor_steps() before definition below.
-static int wait_until_idle(int timeout_ms, int poll_ms);
+#define WAIT_SUPERSEDED (-2)
+static int wait_until_idle(int timeout_ms, int poll_ms,
+                           unsigned int generation);
 static void compute_axis_speeds(int requested_speed, int *x_speed,
                                 int *y_speed);
 static void motor_set_axis_speed(int x_speed, int y_speed);
@@ -789,6 +795,7 @@ static void start_motion_active_tracker(void);
 static int get_motion_timeout_ms(void);
 static int chunk_timeout_ms(int steps, int speed, int floor_ms);
 static void physical_delta_to_steps(int *dx, int *dy);
+static int spawn_detached_worker(void *(*fn)(void *), void *arg);
 
 // Derive the default speed from the loaded config. Shared between startup
 // and the 'R' (reload) IPC command so both apply identical semantics.
@@ -838,11 +845,16 @@ void motor_ioctl(int cmd, void *arg) {
 }
 
 static void motor_steps_impl(int xsteps, int ysteps, int stepspeed,
-                             bool wait_before) {
+                             bool wait_before, unsigned int generation) {
   struct motors_steps steps;
 
-  if (wait_before)
-    wait_until_idle(5000, 20); // avoid overlapping commands
+  // Timing out here is fine - the move is issued into a still-busy driver on
+  // purpose, as it always has been. Being superseded is not: the caller has
+  // been replaced, and issuing its move now would fight the one that replaced
+  // it.
+  if (wait_before &&
+      wait_until_idle(5000, 20, generation) == WAIT_SUPERSEDED)
+    return;
 
   // Apply the correct inversion based on the motor_inversion_state
   steps.x = (motor_inversion_state & MOTOR_INVERT_X) ? -xsteps : xsteps;
@@ -870,8 +882,8 @@ static void motor_steps_impl(int xsteps, int ysteps, int stepspeed,
     // Same distance-scaling as run_profiled_move()'s waits: a diagonal
     // hold-to-move puts a full-travel X leg here, which does not fit the
     // fixed nudge-sized budget. See chunk_timeout_ms().
-    if (wait_until_idle(chunk_timeout_ms(steps.x, eff_speed_x, timeout_ms),
-                        10) != 0)
+    if (wait_until_idle(chunk_timeout_ms(steps.x, eff_speed_x, timeout_ms), 10,
+                        generation) != 0)
       return;
 
     motor_set_axis_speed(eff_speed_x, eff_speed_y);
@@ -1051,7 +1063,12 @@ int motor_is_busy() {
 }
 
 void motor_steps(int xsteps, int ysteps, int stepspeed) {
-  motor_steps_impl(xsteps, ysteps, stepspeed, true);
+  motor_steps_impl(xsteps, ysteps, stepspeed, true, 0);
+}
+
+static void motor_steps_gen(int xsteps, int ysteps, int stepspeed,
+                            unsigned int generation) {
+  motor_steps_impl(xsteps, ysteps, stepspeed, true, generation);
 }
 
 static int execute_profile_phase(int total, int phase_end, int xsteps,
@@ -1084,10 +1101,11 @@ static int execute_profile_phase(int total, int phase_end, int xsteps,
   if (chunk_x == 0 && chunk_y == 0)
     return 0;
 
-  motor_steps_impl(chunk_x, chunk_y, speed_now, false);
+  motor_steps_impl(chunk_x, chunk_y, speed_now, false, generation);
   {
     int chunk = (abs(chunk_x) > abs(chunk_y)) ? abs(chunk_x) : abs(chunk_y);
-    if (wait_until_idle(chunk_timeout_ms(chunk, speed_now, timeout_ms), 10) != 0)
+    if (wait_until_idle(chunk_timeout_ms(chunk, speed_now, timeout_ms), 10,
+                        generation) != 0)
       return -1;
   }
 
@@ -1113,13 +1131,27 @@ void motor_set_position(int xpos, int ypos, int stepspeed) {
 }
 
 // Poll until motors are idle or timeout (milliseconds). Returns 0 on idle, -1
-// on timeout/error
-static int wait_until_idle(int timeout_ms, int poll_ms) {
+// on timeout/error, WAIT_SUPERSEDED when a newer move has taken over.
+//
+// The two failures are not the same thing to a caller: a timeout means the
+// hardware is still busy and the move should be issued anyway (that is what
+// the pre-move wait has always done), while superseded means nothing this
+// worker was going to do is wanted any more.
+//
+// generation is the caller's motion generation, or 0 for a caller that has
+// none (homing). Giving one matters under a held joystick: these waits run for
+// up to 15 s, so without a cancellation check every superseded move worker
+// keeps polling the driver until its own budget runs out, and a stream of
+// updates at 11 Hz stacks up dozens of threads that have nothing left to do.
+static int wait_until_idle(int timeout_ms, int poll_ms,
+                           unsigned int generation) {
   const int loops = (timeout_ms <= 0 || poll_ms <= 0)
                         ? 1
                         : (timeout_ms + poll_ms - 1) / poll_ms;
   for (int i = 0; i < loops; ++i) {
     struct motor_message msg;
+    if (generation && motion_is_cancelled(generation))
+      return WAIT_SUPERSEDED;
     motor_status_get(&msg);
     if (msg.status == MOTOR_IS_STOP)
       return 0;
@@ -1239,6 +1271,103 @@ static void motion_cancel_all(bool stop_now) {
     motor_ioctl(MOTOR_STOP, NULL);
 }
 
+// ---- deferred MOTOR_STOP ---------------------------------------------------
+//
+// MOTOR_STOP is not a poke at a register, it is a wait. The T31 driver's
+// motor_ops_stop() (ingenic-sdk misc/motor/motor.c) truncates the remaining
+// move and then blocks on
+//
+//   wait_for_completion_interruptible_timeout(&mdev->stop_completion, 15000ms)
+//
+// until the stepping ISR reports the motors parked. Measured on a T31X with
+// two PTZ clients: 1.2 s typically, and exactly 15000 ms whenever the other
+// client re-issues MOTOR_MOVE before the completion fires, because the ISR
+// then never signals the waiter and the kernel timeout is the only way out.
+//
+// Running that on a WebSocket connection thread is what killed connections:
+// for the whole wait the thread reads no frames, answers no PING and no CLOSE,
+// and sends no status pushes, so the client sees a dead socket and gives up -
+// and the commands that piled up meanwhile arrive as one burst afterwards.
+//
+// So the wait happens here, on one dedicated thread, and callers return
+// immediately. One thread, not one per stop: stop is idempotent, so a request
+// arriving while another is in flight coalesces into the pending flag instead
+// of queueing another 15-second ioctl.
+static pthread_mutex_t stop_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t stop_cond = PTHREAD_COND_INITIALIZER;
+static bool stop_pending = false;
+static bool stop_thread_running = false;
+// Motion generation the pending stop was requested against; a stop is skipped
+// if a newer move has begun since, so a stop that waited out the kernel's
+// 15 s timeout cannot come back and kill a move the user asked for after it.
+static unsigned int stop_for_generation;
+
+static void *stop_worker(void *arg) {
+  (void)arg;
+  for (;;) {
+    unsigned int want;
+
+    pthread_mutex_lock(&stop_lock);
+    while (!stop_pending)
+      pthread_cond_wait(&stop_cond, &stop_lock);
+    stop_pending = false;
+    want = stop_for_generation;
+    pthread_mutex_unlock(&stop_lock);
+
+    pthread_mutex_lock(&motion_lock);
+    bool stale = (motion_generation != want);
+    pthread_mutex_unlock(&motion_lock);
+    if (stale)
+      continue;
+
+    motor_ioctl(MOTOR_STOP, NULL);
+
+    // Only now is "no motion in progress" true - the ioctl above returns when
+    // the hardware has parked, roughly a second after the stop was asked for.
+    // Clearing the flag at request time instead would tell the motion
+    // detectors the camera is still while it is decelerating. Re-check first:
+    // a move begun while we waited owns the flag, not us.
+    pthread_mutex_lock(&motion_lock);
+    stale = (motion_generation != want);
+    pthread_mutex_unlock(&motion_lock);
+    if (!stale)
+      remove_motion_active_flag();
+  }
+  return NULL;
+}
+
+static void request_motor_stop(void) {
+  bool queued = false;
+
+  pthread_mutex_lock(&stop_lock);
+  if (stop_thread_running) {
+    pthread_mutex_lock(&motion_lock);
+    stop_for_generation = motion_generation;
+    pthread_mutex_unlock(&motion_lock);
+    stop_pending = true;
+    pthread_cond_signal(&stop_cond);
+    queued = true;
+  }
+  pthread_mutex_unlock(&stop_lock);
+
+  // No worker thread (it failed to start): better a blocked caller than a
+  // camera that ignores "stop".
+  if (!queued) {
+    motor_ioctl(MOTOR_STOP, NULL);
+    remove_motion_active_flag();
+  }
+}
+
+static void start_stop_worker(void) {
+  if (spawn_detached_worker(stop_worker, NULL) != 0) {
+    syslog(LOG_ERR, "cannot start the motor-stop thread, stops will block");
+    return;
+  }
+  pthread_mutex_lock(&stop_lock);
+  stop_thread_running = true;
+  pthread_mutex_unlock(&stop_lock);
+}
+
 static int run_profiled_move(int xsteps, int ysteps, int requested_speed,
                              unsigned int generation) {
   const int total = (abs(xsteps) > abs(ysteps)) ? abs(xsteps) : abs(ysteps);
@@ -1268,8 +1397,9 @@ static int run_profiled_move(int xsteps, int ysteps, int requested_speed,
   if (accel <= 0 || total < 8) {
     if (motion_is_cancelled(generation))
       return -1;
-    motor_steps(xsteps, ysteps, max_speed);
-    if (wait_until_idle(chunk_timeout_ms(total, max_speed, timeout_ms), 10) != 0)
+    motor_steps_gen(xsteps, ysteps, max_speed, generation);
+    if (wait_until_idle(chunk_timeout_ms(total, max_speed, timeout_ms), 10,
+                        generation) != 0)
       return -1;
     return motion_is_cancelled(generation) ? -1 : 0;
   }
@@ -1355,43 +1485,82 @@ static int spawn_detached_worker(void *(*fn)(void *), void *arg) {
   return 0;
 }
 
-static void *async_move_worker(void *arg) {
-  struct async_move *move = (struct async_move *)arg;
+// One motion thread with a single pending slot, rather than a detached worker
+// per move.
+//
+// There is one motor, so a second worker has nothing to do but fight the first
+// for it - and the newest request superseding every older one is already what
+// the generation counter means. The slot makes that explicit: a request that
+// arrives while another is still queued replaces it.
+//
+// The shape matters because the dispatch rate is not the gesture rate. A held
+// joystick sends ~11 updates a second, and two clients pushing opposite
+// directions make every one of those updates look like a reversal to
+// motor_ctl_vector(), so moves were being dispatched around 30 times a second.
+// A worker that has entered MOTOR_STOP cannot be cancelled and sits in the
+// driver until it returns, so they accumulated faster than they retired -
+// measured at 258 live threads (16 MB of stack reservations) with three
+// clients on the Garage T31X.
+static pthread_mutex_t move_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t move_cond = PTHREAD_COND_INITIALIZER;
+static struct async_move pending_move;
+static bool move_pending = false;
+static bool move_thread_running = false;
 
-  if (!move)
-    return NULL;
+static void *move_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    struct async_move m;
 
-  write_motion_active_flag();
-  (void)run_profiled_move(move->x_steps, move->y_steps, move->speed,
-                          move->generation);
-  if (motion_is_current(move->generation))
-    remove_motion_active_flag();
-  free(move);
+    pthread_mutex_lock(&move_lock);
+    while (!move_pending)
+      pthread_cond_wait(&move_cond, &move_lock);
+    m = pending_move;
+    move_pending = false;
+    pthread_mutex_unlock(&move_lock);
+
+    write_motion_active_flag();
+    if (m.stop_first)
+      motor_ioctl(MOTOR_STOP, NULL);
+    (void)run_profiled_move(m.x_steps, m.y_steps, m.speed, m.generation);
+    if (motion_is_current(m.generation))
+      remove_motion_active_flag();
+  }
   return NULL;
 }
 
-static int start_profiled_move_async(int xsteps, int ysteps, int speed) {
-  struct async_move *move = NULL;
+static void start_move_thread(void) {
+  if (spawn_detached_worker(move_thread, NULL) != 0) {
+    syslog(LOG_ERR, "cannot start the motion thread, moves will run inline");
+    return;
+  }
+  pthread_mutex_lock(&move_lock);
+  move_thread_running = true;
+  pthread_mutex_unlock(&move_lock);
+}
+
+static int start_profiled_move_async(int xsteps, int ysteps, int speed,
+                                     bool stop_first) {
+  bool queued = false;
 
   // For rapid UI nudges, avoid hard-stopping on every new command.
   // Generation handoff still cancels the previous profile at segment boundary.
   motion_cancel_all(false);
 
-  move = calloc(1, sizeof(*move));
-  if (!move)
-    return -1;
-
-  move->x_steps = xsteps;
-  move->y_steps = ysteps;
-  move->speed = speed;
-  move->generation = motion_begin_new();
-
-  if (spawn_detached_worker(async_move_worker, move) != 0) {
-    free(move);
-    return -1;
+  pthread_mutex_lock(&move_lock);
+  if (move_thread_running) {
+    pending_move.x_steps = xsteps;
+    pending_move.y_steps = ysteps;
+    pending_move.speed = speed;
+    pending_move.stop_first = stop_first;
+    pending_move.generation = motion_begin_new();
+    move_pending = true;
+    pthread_cond_signal(&move_cond);
+    queued = true;
   }
+  pthread_mutex_unlock(&move_lock);
 
-  return 0;
+  return queued ? 0 : -1;
 }
 
 // motor_steps_impl() unconditionally applies motor_inversion_state to every
@@ -1457,8 +1626,8 @@ static void motor_status_get_logical(struct motor_message *msg) {
 }
 
 static void dispatch_profiled_move(int xsteps, int ysteps, int speed,
-                                   const char *log_tag) {
-  if (start_profiled_move_async(xsteps, ysteps, speed) == 0) {
+                                   bool stop_first, const char *log_tag) {
+  if (start_profiled_move_async(xsteps, ysteps, speed, stop_first) == 0) {
     if (log_tag)
       syslog(LOG_DEBUG, "%s", log_tag);
     return;
@@ -1467,6 +1636,8 @@ static void dispatch_profiled_move(int xsteps, int ysteps, int speed,
   // Fallback remains profiled: run synchronously if thread creation fails.
   unsigned int generation = motion_begin_new();
   write_motion_active_flag();
+  if (stop_first)
+    motor_ioctl(MOTOR_STOP, NULL);
   (void)run_profiled_move(xsteps, ysteps, speed, generation);
   remove_motion_active_flag();
 
@@ -1546,7 +1717,7 @@ static int enhanced_homing_daemon(int stepspeed) {
     syslog(LOG_DEBUG, "Enhanced homing phase 1: dx=%d dy=%d speed=%d", half_x,
       half_y, stepspeed);
     motor_steps(half_x, half_y, stepspeed);
-  if (wait_until_idle(t1_ms, 100) != 0) {
+  if (wait_until_idle(t1_ms, 100, 0) != 0) {
     syslog(LOG_DEBUG,
            "Timeout waiting for enhanced homing phase 1 to complete.");
     return -1;
@@ -1561,7 +1732,7 @@ static int enhanced_homing_daemon(int stepspeed) {
     syslog(LOG_DEBUG, "Enhanced homing phase 2: dx=%d dy=%d speed=%d", -full_x,
       -full_y, stepspeed);
     motor_steps(-full_x, -full_y, stepspeed);
-  if (wait_until_idle(t2_ms, 100) != 0) {
+  if (wait_until_idle(t2_ms, 100, 0) != 0) {
     syslog(LOG_DEBUG,
            "Timeout waiting for enhanced homing phase 2 to complete.");
     return -1;
@@ -1576,7 +1747,7 @@ static int enhanced_homing_daemon(int stepspeed) {
     syslog(LOG_DEBUG, "Enhanced homing phase 3: dx=%d dy=%d speed=%d", half_x,
       half_y, stepspeed);
     motor_steps(half_x, half_y, stepspeed);
-  if (wait_until_idle(t3_ms, 100) != 0) {
+  if (wait_until_idle(t3_ms, 100, 0) != 0) {
     syslog(LOG_DEBUG,
            "Timeout waiting for enhanced homing center move to complete.");
     return -1;
@@ -1601,7 +1772,7 @@ static int enhanced_homing_daemon(int stepspeed) {
              status.x, status.y, center_x, center_y, corr_dx, corr_dy);
       physical_delta_to_steps(&corr_dx, &corr_dy);
       motor_steps(corr_dx, corr_dy, stepspeed);
-      if (wait_until_idle(t3_ms, 100) != 0) {
+      if (wait_until_idle(t3_ms, 100, 0) != 0) {
         syslog(LOG_DEBUG,
                "Timeout waiting for enhanced homing center correction.");
         return -1;
@@ -1659,8 +1830,11 @@ int motor_ctl_resolve_speed(int requested_speed) {
   return request_speed;
 }
 
-void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
-                        int *applied_y) {
+// stop_first: hand the reversal's MOTOR_STOP to the move worker instead of
+// issuing it on the caller's thread. See request_motor_stop().
+static void motor_ctl_relative_ex(int rel_x, int rel_y, int speed,
+                                  bool stop_first, int *applied_x,
+                                  int *applied_y) {
   struct motor_message motor_message;
 
   motor_ctl_lock();
@@ -1727,10 +1901,16 @@ void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
     if (applied_y)
       *applied_y = rel_y;
 
-    dispatch_profiled_move(rel_x, rel_y, speed, "Profiled driver move started");
+    dispatch_profiled_move(rel_x, rel_y, speed, stop_first,
+                           "Profiled driver move started");
   }
 
   motor_ctl_unlock();
+}
+
+void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
+                        int *applied_y) {
+  motor_ctl_relative_ex(rel_x, rel_y, speed, false, applied_x, applied_y);
 }
 
 // --- continuous vector ('vector', WebSocket only) -------------------------
@@ -1848,13 +2028,17 @@ bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
   pthread_mutex_unlock(&vector_lock);
 
   if (direction_changed) {
-    // motor_ctl_stop() first, and not only because reversing a stepper needs
-    // it: motor_steps() opens with wait_until_idle(5000), so issuing into a
-    // move that is still running would park the new worker for five seconds
-    // before the new direction reached the hardware.
-    motor_ctl_stop();
-    motor_ctl_relative(dir_x * travel_x, dir_y * travel_y,
-                       (sx > sy) ? sx : sy, NULL, NULL);
+    // The move worker stops before it moves, and not only because reversing a
+    // stepper needs it: motor_steps() opens with wait_until_idle(5000), so
+    // issuing into a move that is still running would park the new worker for
+    // five seconds before the new direction reached the hardware.
+    //
+    // stop-then-move on the worker rather than a stop here followed by a move:
+    // both halves then run on one thread in that order, which a deferred stop
+    // plus a separately dispatched move could not guarantee - and neither half
+    // blocks the frontend thread that is serving the joystick.
+    motor_ctl_relative_ex(dir_x * travel_x, dir_y * travel_y,
+                          (sx > sy) ? sx : sy, true, NULL, NULL);
     // No per-axis push on this call. dispatch_profiled_move() is
     // asynchronous and its worker calls motor_set_axis_speed() itself, so a
     // push from here would race it and lose. The next update applies the
@@ -1970,7 +2154,7 @@ void motor_ctl_absolute(int x, int got_x, int y, int got_y, int speed,
       *target_y_out = target_y;
 
     physical_delta_to_steps(&rel_x, &rel_y);
-    dispatch_profiled_move(rel_x, rel_y, speed,
+    dispatch_profiled_move(rel_x, rel_y, speed, false,
                            "Profiled driver absolute move started");
   }
 
@@ -1998,9 +2182,15 @@ void motor_ctl_cruise(void) {
 // A PTZ stop has to reach the hardware immediately or it is not a stop. Held
 // behind the mutex it would be unreachable for the whole duration of a homing
 // sweep (up to ~35s) - precisely the situation in which a user reaches for
-// it. Both things it touches are already safe to call concurrently:
-// motion_cancel_all() has its own motion_lock and then issues MOTOR_STOP, and
-// remove_motion_active_flag() is a bare unlink().
+// it. Everything it touches is already safe to call concurrently:
+// motion_cancel_all() has its own motion_lock, remove_motion_active_flag() is
+// a bare unlink(), and the MOTOR_STOP ioctl is handed to the stop thread.
+//
+// It does not WAIT for the stop either. The generation bump below cancels
+// every in-flight profiled move at once and synchronously, which is the part a
+// caller could observe; the ioctl that parks the hardware blocks for over a
+// second and sometimes for the driver's full 15 s timeout, so it runs on the
+// stop thread - see request_motor_stop().
 //
 // This changes nothing on the AF_UNIX path, which is still serial and can
 // never overlap anything. Caveat on the WS path, where it now CAN overlap:
@@ -2011,8 +2201,10 @@ void motor_ctl_cruise(void) {
 // reality. Teaching homing to cancel means changing hard-won motion code and
 // is deliberately out of scope here.
 void motor_ctl_stop(void) {
-  motion_cancel_all(true);
-  remove_motion_active_flag();
+  motion_cancel_all(false);
+  // MOTOR_ACTIVE_FLAG is cleared by whoever performs the ioctl, once the
+  // hardware has parked - see request_motor_stop().
+  request_motor_stop();
   // Releasing the stick has to go through here too, or the next gesture in
   // the same direction would look like an unchanged vector and get a speed
   // push against a move that no longer exists - a joystick that moves the
@@ -2109,7 +2301,7 @@ bool motor_ctl_reload(struct motor_message *out) {
   // below remains the actual mechanism, exactly as before.
   motion_cancel_all(true);
   remove_motion_active_flag();
-  if (wait_until_idle(2000, 20) != 0)
+  if (wait_until_idle(2000, 20, 0) != 0)
     syslog(LOG_WARNING, "motors -R: motors still moving after 2s wait; "
                         "reloading config anyway");
   usleep(50 * 1000); // let cancelled workers pass their final checks
@@ -2395,6 +2587,10 @@ int main(int argc, char *argv[]) {
     syslog(LOG_ERR, "Unable to open /dev/motor: %s", strerror(errno));
     exit(EXIT_FAILURE);
   }
+
+  // After /dev/motor is open: both threads exist only to call ioctl on it.
+  start_stop_worker();
+  start_move_thread();
 
   sync_kernel_limit_mode(g_cfg.hw.limitless);
   if (g_cfg.hw.limitless) {
