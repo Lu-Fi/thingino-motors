@@ -814,6 +814,51 @@ static void client_release(void) {
   pthread_mutex_unlock(&g_count_lock);
 }
 
+/* How long the teardown will wait for the peer to acknowledge the close before
+ * giving up on an orderly one. Short: this only covers one round trip on a LAN,
+ * and the thread is otherwise finished. */
+#define WS_CLOSE_LINGER_MS 500
+
+/* close() on a socket that still has unread bytes in its receive queue sends
+ * an RST instead of a FIN, and an RST makes the peer's TCP discard whatever is
+ * still sitting in ITS receive buffer - including the close frame written a
+ * microsecond earlier. A PTZ client streaming at 11 Hz practically always has
+ * a command or two queued here, which is how a deliberate, correctly coded
+ * close still reached the browser as "no close frame received".
+ *
+ * So: stop writing, then read until the peer's own FIN (or the deadline) so the
+ * queue is empty when close() runs. Everything read here is discarded - the
+ * connection is over, and the only thing that matters is that the bytes are
+ * consumed. */
+static void close_gracefully(int fd) {
+  long long deadline = now_ms() + WS_CLOSE_LINGER_MS;
+  char sink[512];
+
+  shutdown(fd, SHUT_WR);
+
+  for (;;) {
+    struct pollfd p = {.fd = fd, .events = POLLIN, .revents = 0};
+    int left = (int)(deadline - now_ms());
+    ssize_t n;
+
+    if (left <= 0)
+      break;
+    if (poll(&p, 1, left) <= 0)
+      break;
+
+    n = read(fd, sink, sizeof(sink));
+    if (n == 0) /* peer's FIN: nothing left to drain */
+      break;
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+  }
+
+  close(fd);
+}
+
 static void *conn_thread(void *arg) {
   ws_client *c = (ws_client *)arg;
   ws_handshake hs;
@@ -945,9 +990,15 @@ static void *conn_thread(void *arg) {
     rc = ws_read_message(&c->ws, &opcode, msg, sizeof(msg), &len, wait_ms);
 
     if (rc == WS_AGAIN) {
-      if (periodic(c) != WS_OK)
-        break;
-      continue;
+      /* WS_CLOSED from periodic() means the keepalive gave up and has already
+       * sent its own close; anything else is a failed write, which gets one
+       * more attempt at saying why. */
+      int prc = periodic(c);
+      if (prc == WS_OK)
+        continue;
+      if (prc != WS_CLOSED)
+        ws_send_close(&c->io, WS_CLOSE_INTERNAL, "send failed");
+      break;
     }
     if (rc == WS_CLOSED) {
       ws_send_close(&c->io, WS_CLOSE_NORMAL, "bye");
@@ -961,8 +1012,14 @@ static void *conn_thread(void *arg) {
       ws_send_close(&c->io, WS_CLOSE_PROTOCOL, "protocol error");
       break;
     }
-    if (rc != WS_OK)
+    if (rc != WS_OK) {
+      /* WS_EIO: the read failed or a frame arrived torn. Saying so costs one
+       * frame on a socket that may well be dead already, and is the difference
+       * between a client that can log "the server closed with 1011" and one
+       * that can only report that the connection vanished. */
+      ws_send_close(&c->io, WS_CLOSE_INTERNAL, "read error");
       break;
+    }
 
     if (opcode != WS_OP_TEXT) {
       ws_send_close(&c->io, WS_CLOSE_UNSUPPORTED, "text frames only");
@@ -970,6 +1027,12 @@ static void *conn_thread(void *arg) {
     }
 
     if (!rate_ok(c)) {
+      /* CONSECUTIVE throttles, reset below on the first command that is let
+       * through. A lifetime total would eventually close every long-lived
+       * connection that ever saw a burst: a client held at 11 commands/s is
+       * nowhere near the 25/s limit, but any stall inside the daemon makes the
+       * commands it sent meanwhile arrive together, and that burst alone can
+       * drain a bucket that only banks one second of tokens. */
       if (++c->strikes > WS_MAX_STRIKES) {
         syslog(LOG_WARNING, "ws: %s exceeded the command rate limit, closing",
                c->peer);
@@ -980,9 +1043,12 @@ static void *conn_thread(void *arg) {
         break;
       continue;
     }
+    c->strikes = 0;
 
-    if (handle_command(c, (const char *)msg) != WS_OK)
+    if (handle_command(c, (const char *)msg) != WS_OK) {
+      ws_send_close(&c->io, WS_CLOSE_INTERNAL, "send failed");
       break;
+    }
 
     /* A command almost always moves something; force the next periodic() to
      * SAMPLE now rather than waiting out a full interval. Only last_poll_ms:
@@ -993,8 +1059,14 @@ static void *conn_thread(void *arg) {
      * own ack or error, so there is no reply owed here. */
     c->last_poll_ms = 0;
 
-    if (periodic(c) != WS_OK)
-      break;
+    {
+      int prc = periodic(c);
+      if (prc != WS_OK) {
+        if (prc != WS_CLOSED)
+          ws_send_close(&c->io, WS_CLOSE_INTERNAL, "send failed");
+        break;
+      }
+    }
   }
 
   syslog(LOG_INFO, "ws: client %s disconnected", c->peer);
@@ -1010,7 +1082,7 @@ done:
     c->io.tls = NULL;
   }
 #endif
-  close(c->io.fd);
+  close_gracefully(c->io.fd);
   client_release();
   free(c);
   return NULL;
@@ -1059,7 +1131,7 @@ static void *listen_thread(void *arg) {
       ws_io rej = {.fd = fd, .tls = NULL};
       ws_handshake_reject(&rej, 503, "Service Unavailable",
                           "too many clients\n");
-      close(fd);
+      close_gracefully(fd);
       syslog(LOG_WARNING, "ws: connection limit (%d) reached, rejecting %s",
              g_cfg.max_clients, pbuf);
       continue;
