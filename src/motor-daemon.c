@@ -1939,7 +1939,15 @@ void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
 // See motor-ctl.h for why a stick deflection is not just a repeated 'move'.
 
 // Backstop dead zone (per-mille); the browser's own is larger.
-#define VECTOR_DEADZONE 40
+//
+// Two thresholds, not one. A deflection parked ON a single threshold - a
+// pointer held near an axis and wobbling a couple of degrees, which at full
+// throw puts the minor axis right around 40 - would flip that axis's dir
+// 0<->+-1 every update, and every flip reads as a reversal below and costs a
+// full MOTOR_STOP decel tail plus a restart. Measured cost of that cycling:
+// ~530 steps/s against ~860 for the same hold held steady.
+#define VECTOR_DEADZONE 40    // release: an already-moving axis keeps going
+#define VECTOR_DEADZONE_ON 90 // engage: an idle axis has to clear this first
 
 // Speed at the dead-zone edge, as % of full-deflection speed.
 #define VECTOR_MIN_SPEED_PCT 12
@@ -1954,6 +1962,18 @@ static void vector_release(void) {
   vector_dir_x = 0;
   vector_dir_y = 0;
   pthread_mutex_unlock(&vector_lock);
+}
+
+// Schmitt trigger on one axis. `prev` is that axis's currently latched dir,
+// so re-engaging in the opposite sign has to clear the engage threshold too -
+// a reversal is exactly the case that must not be cheap to trigger.
+static int vector_axis_dir(int v, int prev) {
+  int mag = (v < 0) ? -v : v;
+  int sign = (v > 0) - (v < 0);
+  int threshold =
+      (prev && sign == prev) ? VECTOR_DEADZONE : VECTOR_DEADZONE_ON;
+
+  return (mag > threshold) ? sign : 0;
 }
 
 // Deflection-to-speed curve exponent (1.0 = linear; below = more
@@ -1981,10 +2001,20 @@ static int vector_axis_speed(int deflection, int ref_speed) {
 bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
                       int *speed_y_out) {
   struct motor_message m;
-  int dir_x = (vx > VECTOR_DEADZONE) - (vx < -VECTOR_DEADZONE);
-  int dir_y = (vy > VECTOR_DEADZONE) - (vy < -VECTOR_DEADZONE);
+  int dir_x, dir_y, prev_x, prev_y;
   int travel_x, travel_y, base, sx, sy, ex, ey;
   bool direction_changed;
+
+  // One read of the latched pair, reused for the hysteresis decision and for
+  // direction_changed below: re-reading it after the dispatch would let a
+  // concurrent update land in between and mask a reversal.
+  pthread_mutex_lock(&vector_lock);
+  prev_x = vector_dir_x;
+  prev_y = vector_dir_y;
+  pthread_mutex_unlock(&vector_lock);
+
+  dir_x = vector_axis_dir(vx, prev_x);
+  dir_y = vector_axis_dir(vy, prev_y);
 
   if (speed_x_out)
     *speed_x_out = 0;
@@ -1992,6 +2022,8 @@ bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
     *speed_y_out = 0;
 
   if (!dir_x && !dir_y) {
+    // motor_ctl_stop() clears the latch itself, so a stick centred and pushed
+    // out again starts from prev=0 and has to clear the engage threshold.
     motor_ctl_stop();
     return true;
   }
@@ -2044,9 +2076,7 @@ bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
   if (sy < MOTOR1_MIN_SPEED)
     sy = MOTOR1_MIN_SPEED;
 
-  pthread_mutex_lock(&vector_lock);
-  direction_changed = (dir_x != vector_dir_x || dir_y != vector_dir_y);
-  pthread_mutex_unlock(&vector_lock);
+  direction_changed = (dir_x != prev_x || dir_y != prev_y);
 
   if (direction_changed) {
     // The move worker stops before it moves, and not only because reversing a
