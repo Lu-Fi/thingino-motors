@@ -135,8 +135,9 @@ Example config lives well in /etc/motors.json.
 This fork adds a WebSocket listener inside `motors-daemon`. A UI holds one
 connection instead of paying a full round trip per move (httpd -> CGI ->
 `ingenic-motor` -> AF_UNIX -> daemon, then another one for the status echo).
-Nothing about the CLI or the `/dev/md` socket changes; this is an additional
-frontend, and if it fails to start the daemon keeps running without it.
+The CLI and the `/dev/md` wire format are unchanged; this is an additional
+frontend, and if it fails to start the daemon keeps running without it. (The
+`/dev/md` loop did get hardened alongside it - see "Fixed on this branch".)
 
 Default endpoint:
 
@@ -393,7 +394,13 @@ preset, so it is set explicitly; 3.x already defaults there).
   the driver without the lock during such an operation.
 - **A transient `accept()` error closed the listener for good** (EMFILE,
   ENOBUFS, EPROTO, ...). The WebSocket listener now backs off 200 ms and
-  retries.
+  retries; so does the `/dev/md` loop, which used to `exit()` the whole daemon.
+- **`/dev/md`: an empty connection was executed as a stop.** A short or empty
+  read fell through with the request defaults (`'d'`/`'s'`), and the CLI
+  connects before it parses its arguments - so `ingenic-motor -h` or a typo
+  stopped a moving camera. Such reads are ignored now, the fd no longer leaks
+  on that path, and a client that connects without writing no longer blocks the
+  loop (2 s receive timeout).
 - **stdin/stdout/stderr were left closed after daemonizing.** libjct prints to
   stderr on every malformed JSON, so those bytes went to whichever descriptor
   held fd 2 - on the cameras checked, the WS listening socket, where they were

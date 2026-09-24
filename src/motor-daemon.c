@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <sys/un.h>
 
@@ -2877,21 +2878,46 @@ int main(int argc, char *argv[]) {
     // blocking code, wait for a connection
     int clientfd = accept(serverfd, NULL, NULL);
     if (clientfd == -1) {
-      syslog(LOG_DEBUG,
-             "clientfd is invalid after connection accept, socket doesnt work "
-             "and is %i errno : %i",
-             clientfd, errno);
-      syslog(LOG_DEBUG, "exiting...");
-      exit(EXIT_FAILURE);
+      // Only a broken listening socket is fatal. EINTR, a connection that
+      // died in the backlog, or a momentary fd/memory shortage used to exit
+      // the whole daemon - WebSocket frontend included - on the spot.
+      if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK) {
+        syslog(LOG_ERR, "accept on %s failed: %s, exiting", SV_SOCK_PATH,
+               strerror(errno));
+        exit(EXIT_FAILURE);
+      }
+      if (errno != EINTR && errno != ECONNABORTED) {
+        syslog(LOG_WARNING, "accept on %s failed: %s, retrying", SV_SOCK_PATH,
+               strerror(errno));
+        usleep(200 * 1000);
+      }
+      continue;
     }
     syslog(LOG_DEBUG, "Accepting a connection\n");
 
+    // Bound the wait for the request. This loop is the whole AF_UNIX
+    // frontend, so a local process that connects and never writes used to
+    // stall every later `motors` call - the web UI's CGI path included -
+    // until it went away.
+    {
+      struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+      setsockopt(clientfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
     // load the message onto the reques_message struct
-    if (read(clientfd, &request_message, sizeof(struct request)) == -1) {
+    ssize_t got = read(clientfd, &request_message, sizeof(struct request));
+    if (got != (ssize_t)sizeof(struct request)) {
+      // A short or empty read is NOT a request. It used to fall through with
+      // requestcleanup()'s defaults still in place - 'd'/'s', a stop - so any
+      // `motors` invocation that connects and then exits without sending
+      // (it connects before parsing its arguments: `motors -h`, a typo) quietly
+      // stopped the camera. The fd is closed on this path too; it used to
+      // leak.
       syslog(LOG_DEBUG,
-             "Could not read message from motors app, ignore request");
-      syslog(LOG_DEBUG, "client fd at this point is %i errno : %i", clientfd,
-             errno);
+             "Incomplete request from motors app (%d bytes, errno %d), "
+             "ignored",
+             (int)got, (got < 0) ? errno : 0);
+      close(clientfd);
     } else {
       syslog(LOG_DEBUG, "request command is %c", request_message.command);
       // The command bodies now live in the motor_ctl_* handlers above, shared
