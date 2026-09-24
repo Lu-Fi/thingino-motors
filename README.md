@@ -405,6 +405,10 @@ preset, so it is set explicitly; 3.x already defaults there).
 
 ### Changed on this branch
 
+- **Superseded moves stop waiting at once.** Motion workers sleep on a
+  condition variable (`CLOCK_MONOTONIC`) that a new move or a stop broadcasts,
+  instead of discovering it at the next driver poll; long hold-to-move chunks
+  therefore poll the driver every 25 ms instead of 10 ms.
 - **One shared status sample** (40 ms) for all subscribed clients instead of
   one ioctl plus lock attempt per client, invalidated after every command.
 - **Less copying and stack per frame:** payloads are read straight into the

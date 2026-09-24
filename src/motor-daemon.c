@@ -10,6 +10,7 @@
 #include <string.h>
 #include <strings.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <json_config.h>
@@ -780,6 +781,12 @@ bool motor_inverted = false; // Global flag for motor inversion
 static pthread_mutex_t motion_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int motion_generation = 0;
 static bool motion_cancelled = false;
+// Broadcast (under motion_lock) whenever the generation moves on or motion is
+// cancelled, so a worker sleeping between driver polls in wait_until_idle()
+// learns it has been superseded at once instead of at its next poll.
+// motion_cond_init() switches it to CLOCK_MONOTONIC before any thread exists.
+static pthread_cond_t motion_cond = PTHREAD_COND_INITIALIZER;
+static clockid_t motion_cond_clock = CLOCK_REALTIME;
 
 // Stack for every motion/stop/tracker thread; see motor_spawn_detached().
 #define WORKER_STACK (64 * 1024)
@@ -1166,6 +1173,52 @@ void motor_set_position(int xpos, int ypos, int stepspeed) {
 // up to 15 s, so without a cancellation check every superseded move worker
 // keeps polling the driver until its own budget runs out, and a stream of
 // updates at 11 Hz stacks up dozens of threads that have nothing left to do.
+// CLOCK_MONOTONIC for motion_cond's timed waits: these cameras have no RTC,
+// and the first NTP sync steps CLOCK_REALTIME by hours or years - a backward
+// step in the middle of a timed wait would stall it by that much. Called once
+// from main() before any thread that uses motion_cond exists; on a libc
+// without condattr_setclock the realtime default stays, which is no worse
+// than the usleep() this replaced.
+static void motion_cond_init(void) {
+  pthread_condattr_t attr;
+
+  if (pthread_condattr_init(&attr) != 0)
+    return;
+  if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) == 0) {
+    pthread_cond_destroy(&motion_cond);
+    if (pthread_cond_init(&motion_cond, &attr) == 0)
+      motion_cond_clock = CLOCK_MONOTONIC;
+    else
+      pthread_cond_init(&motion_cond, NULL);
+  }
+  pthread_condattr_destroy(&attr);
+}
+
+// Sleep up to ms, returning early - true - once generation is superseded.
+static bool motion_sleep(unsigned int generation, int ms) {
+  struct timespec ts;
+  bool cancelled;
+  int rc = 0;
+
+  clock_gettime(motion_cond_clock, &ts);
+  ts.tv_sec += ms / 1000;
+  ts.tv_nsec += (long)(ms % 1000) * 1000000L;
+  if (ts.tv_nsec >= 1000000000L) {
+    ts.tv_sec++;
+    ts.tv_nsec -= 1000000000L;
+  }
+
+  pthread_mutex_lock(&motion_lock);
+  for (;;) {
+    cancelled = motion_cancelled || generation != motion_generation;
+    if (cancelled || rc == ETIMEDOUT)
+      break;
+    rc = pthread_cond_timedwait(&motion_cond, &motion_lock, &ts);
+  }
+  pthread_mutex_unlock(&motion_lock);
+  return cancelled;
+}
+
 static int wait_until_idle(int timeout_ms, int poll_ms,
                            unsigned int generation) {
   const int loops = (timeout_ms <= 0 || poll_ms <= 0)
@@ -1178,7 +1231,17 @@ static int wait_until_idle(int timeout_ms, int poll_ms,
     motor_status_get(&msg);
     if (msg.status == MOTOR_IS_STOP)
       return 0;
-    usleep((useconds_t)poll_ms * 1000);
+    // A worker with a generation sleeps on motion_cond, so being superseded
+    // - the common case under a held joystick - ends the wait immediately
+    // rather than after the poll interval; the interval then only bounds how
+    // soon the END of a move is noticed. Homing and reload have no
+    // generation and keep the plain sleep.
+    if (generation) {
+      if (motion_sleep(generation, poll_ms))
+        return WAIT_SUPERSEDED;
+    } else {
+      usleep((useconds_t)poll_ms * 1000);
+    }
   }
   return -1;
 }
@@ -1259,6 +1322,7 @@ static unsigned int motion_begin_new(void) {
   motion_generation++;
   motion_cancelled = false;
   generation = motion_generation;
+  pthread_cond_broadcast(&motion_cond);
   pthread_mutex_unlock(&motion_lock);
 
   return generation;
@@ -1288,6 +1352,7 @@ static void motion_cancel_all(bool stop_now) {
   pthread_mutex_lock(&motion_lock);
   motion_cancelled = true;
   motion_generation++;
+  pthread_cond_broadcast(&motion_cond);
   pthread_mutex_unlock(&motion_lock);
 
   if (stop_now)
@@ -1421,8 +1486,13 @@ static int run_profiled_move(int xsteps, int ysteps, int requested_speed,
     if (motion_is_cancelled(generation))
       return -1;
     motor_steps_gen(xsteps, ysteps, max_speed, generation);
-    if (wait_until_idle(chunk_timeout_ms(total, max_speed, timeout_ms), 10,
-                        generation) != 0)
+    // This is the hold-to-move path: one chunk of up to full travel, i.e.
+    // seconds of driving. Being superseded wakes the wait at once (see
+    // motion_sleep()), so the poll interval only decides how soon the END is
+    // noticed, and polling a full-travel move 100 times a second buys nothing.
+    // Short nudges keep 10 ms, which is what their follow-up latency feels.
+    if (wait_until_idle(chunk_timeout_ms(total, max_speed, timeout_ms),
+                        (total > 200) ? 25 : 10, generation) != 0)
       return -1;
     return motion_is_cancelled(generation) ? -1 : 0;
   }
@@ -2681,6 +2751,7 @@ int main(int argc, char *argv[]) {
   }
 
   // After /dev/motor is open: both threads exist only to call ioctl on it.
+  motion_cond_init();
   start_stop_worker();
   start_move_thread();
 
