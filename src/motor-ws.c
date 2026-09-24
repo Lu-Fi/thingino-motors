@@ -874,6 +874,20 @@ static void *conn_thread(void *arg) {
     setsockopt(c->io.fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
   }
 
+  /* Non-blocking on the plain path too, not only under TLS. Every read in
+   * ws.c already polls first, so reads do not change; what changes is that a
+   * write to a peer that has stopped reading comes back EAGAIN into
+   * write_all()'s deadline instead of blocking inside send() until TCP gives
+   * up - about fifteen minutes on a stock kernel, during which this thread
+   * could not even run its liveness check. */
+  {
+    int fl = fcntl(c->io.fd, F_GETFL, 0);
+    if (fl < 0 || fcntl(c->io.fd, F_SETFL, fl | O_NONBLOCK) < 0) {
+      syslog(LOG_WARNING, "ws: cannot make %s non-blocking, dropping", c->peer);
+      goto done;
+    }
+  }
+
   /* TLS, if this particular connection wants it.
    *
    * ws:// and wss:// share ONE port, chosen by sniffing the first byte the

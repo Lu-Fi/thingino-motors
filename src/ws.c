@@ -181,13 +181,14 @@ static int poll_readable(ws_io *io, int timeout_ms) {
   return poll_fd(io->fd, POLLIN, timeout_ms);
 }
 
-/* How long a blocked write may wait before the connection is given up on.
- * Only ever reached on the TLS path (the plain socket is blocking, so send()
- * does this waiting inside the kernel); it exists so a peer that stops reading
- * cannot pin a connection thread forever once mbedTLS starts returning
- * WANT_WRITE. Generous, because a genuinely slow WiFi client must not be
- * dropped mid-frame - and a torn write is not resynchronisable, so the only
- * thing to do when it does expire is close. */
+/* How long one write_all() may take in total before the connection is given
+ * up on. Both transports are non-blocking (motor-ws.c sets O_NONBLOCK on every
+ * accepted socket, ws_tls_accept() does it for TLS), so this is the ONLY bound
+ * on a peer that stops reading: a blocking send() to a suspended laptop would
+ * otherwise sit in the kernel until TCP's retransmit limit, ~15 minutes, with
+ * the liveness check unable to run. Generous, because a genuinely slow WiFi
+ * client must not be dropped mid-frame - and a torn write is not
+ * resynchronisable, so the only thing to do when it does expire is close. */
 #define WS_WRITE_TIMEOUT_MS 10000
 
 /* Read exactly n bytes or fail. deadline is an absolute ws_now_ms() stamp and
@@ -233,6 +234,7 @@ static int read_exact(ws_io *io, void *buf, size_t n, long long deadline) {
 static int write_all(ws_io *io, const void *buf, size_t n) {
   const unsigned char *p = (const unsigned char *)buf;
   size_t sent = 0;
+  long long deadline = ws_now_ms() + WS_WRITE_TIMEOUT_MS;
 
   while (sent < n) {
     ssize_t w = io_write(io, p + sent, n - sent);
@@ -240,12 +242,20 @@ static int write_all(ws_io *io, const void *buf, size_t n) {
       if (errno == EINTR)
         continue;
       if (errno == EAGAIN || errno == EWOULDBLOCK) {
-        /* POLLIN as well as POLLOUT: mbedTLS can need to READ to make
+        /* On TLS, POLLIN as well as POLLOUT: mbedTLS can need to READ to make
          * progress on a write (a post-handshake message it has to consume
          * first), and ws_tls_write() reports both as EAGAIN. Waiting only for
          * writability would then spin until the timeout on a socket that is
-         * perfectly writable. */
-        if (poll_fd(io->fd, POLLOUT | POLLIN, WS_WRITE_TIMEOUT_MS) != WS_OK)
+         * perfectly writable. A plain socket waits for POLLOUT alone - a
+         * command queued by the peer would otherwise wake this loop at once,
+         * every time, until the deadline.
+         *
+         * One deadline for the whole buffer, re-derived before every poll(),
+         * for the same reason read_exact() has one: a peer that drains a byte
+         * just under the timeout must not be able to extend it forever. */
+        short events = io->tls ? (POLLOUT | POLLIN) : POLLOUT;
+        long long left = deadline - ws_now_ms();
+        if (left <= 0 || poll_fd(io->fd, events, (int)left) != WS_OK)
           return WS_EIO;
         continue;
       }

@@ -343,6 +343,9 @@ preset, so it is set explicitly; 3.x already defaults there).
 - Pre-auth connections are bounded: 5 s for the HTTP handshake, 15 s for the TLS
   one, and connection threads get a 64 KB stack rather than the default
   megabytes.
+- Writes are bounded too: every socket is non-blocking, and a frame that cannot
+  be written within 10 s closes the connection instead of parking its thread
+  in `send()` until TCP gives up.
 - Established connections are pinged every 20 s and closed after 60 s without
   any frame from the peer. All timers use `CLOCK_MONOTONIC` - these cameras have
   no RTC, and under the wall clock the first NTP sync after boot would drop every
@@ -363,6 +366,12 @@ preset, so it is set explicitly; 3.x already defaults there).
   T23 while moving, the longest push gap around a PONG went from ~2050 ms to
   ~220 ms (`ws://` and `wss://`). A fragmented message whose rest never arrives
   is now a torn frame (close 1011) rather than a silent restart of the wait.
+- **A client that stopped reading pinned its thread for ~15 minutes.** Plain
+  sockets were blocking, so `send()` to a suspended laptop waited out TCP's
+  retransmit limit and the liveness check never ran. Every socket is now
+  non-blocking and `write_all()` has one 10 s deadline for the whole buffer; a
+  stalled reader is dropped (measured: 24 s from the first unread byte, of which
+  ~14 s filling the buffers).
 - **The handshake timeout was not a real deadline.** The 5 s budget was passed to
   every `poll()` unchanged, so a client dribbling one byte just under the timeout
   could hold a pre-auth connection - and one of the four listener slots - open
