@@ -434,6 +434,9 @@ preset, so it is set explicitly; 3.x already defaults there).
   `motor_spawn_detached()`; the listener thread is bounded too now, and
   connection threads get 128 KB when wss:// is available (measured 16 KB used
   with an ECDSA certificate; RSA was not measured).
+- **Size:** the daemon is built with `-flto`, and a TLS build uses mbedcrypto's
+  SHA-1/SHA-256 instead of the bundled ones. WS+TLS on a T31 target: text
+  63522 -> 59235 bytes, xz 26684 -> 24476, with all of the above included.
 
 ### Building
 
@@ -446,7 +449,8 @@ make WS=0            # no listener, no token store, ~25 KB less text
 make check           # SHA-1/SHA-256/base64/framing self-test, host build, no libjct
 ```
 
-With `WS_TLS=1`, `sha1.c`/`sha256.c` become thin wrappers over mbedcrypto; the
+The default `CFLAGS` include `-flto` (the link rule passes `CFLAGS` too). With
+`WS_TLS=1`, `sha1.c`/`sha256.c` become thin wrappers over mbedcrypto; the
 self-test builds without TLS and keeps covering the bundled implementations.
 
 `WS_TLS` is off by default because mbedTLS is the only dependency in this tree

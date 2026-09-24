@@ -15,7 +15,14 @@ CC       ?= cc
 # reachable from main. Pure dead-code elimination, no behavior change: it
 # only removes things nothing calls (confirmed here by diffing nm output
 # before/after - the WS listener, token check and JSON depth guard all stay).
-CFLAGS   ?= -Wall -Wextra -O2 -ffunction-sections -fdata-sections
+#
+# -flto on top: with the whole daemon visible at link time the compiler
+# inlines across files and drops what gc-sections cannot see is dead. Measured
+# on the same target build with WS+TLS: text 63522 -> 57734 bytes (-9.1%),
+# xz-compressed (what the squashfs actually stores) 26684 -> 24660 (-7.6%).
+# It sits in CFLAGS rather than LDFLAGS because the link rules below pass
+# CFLAGS too, and LTO must be on for both steps.
+CFLAGS   ?= -Wall -Wextra -O2 -ffunction-sections -fdata-sections -flto
 LDFLAGS  ?= -Wl,--gc-sections
 
 # Cross-compilation (use CROSS_COMPILE=triplet-), e.g.:
