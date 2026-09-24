@@ -396,7 +396,15 @@ static void test_liveness(void) {
   check_int("backdated connection reads as stale",
             ws_conn_idle_ms(&c) >= BACKDATE_MS, 1);
   send_client_frame(sp[1], WS_OP_PONG, true, NULL, 0, true);
-  rc = ws_read_message(&c, &op, out, sizeof out, &len, 200);
+  {
+    long long t0 = ws_now_ms();
+    rc = ws_read_message(&c, &op, out, sizeof out, &len, 200);
+    /* A control frame is a whole message: after it the wait is the caller's
+     * 200 ms again, not the 2 s assembly budget - which stalled a 150 ms
+     * status push for two seconds on every keepalive PONG. */
+    check_int("pong does not stretch the caller's wait",
+              ws_now_ms() - t0 < 1000, 1);
+  }
   check_int("pong still swallowed", rc, WS_AGAIN);
   check_int("pong refreshed liveness", ws_conn_idle_ms(&c) < 1000, 1);
 

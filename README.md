@@ -356,6 +356,13 @@ preset, so it is set explicitly; 3.x already defaults there).
   which `ws_tls_accept()` never reaches because it wraps a socket we accepted
   ourselves. One write to a reset peer terminated the process with no syslog line
   and no core. `SIGPIPE` is now ignored.
+- **Every keepalive PONG stalled status pushes for 2 s.** After the first frame
+  header `ws_read_message()` switched to the 2 s assembly budget and kept it past
+  a PING/PONG, so the wait for the next message was 2 s instead of the caller's
+  150 ms. A control frame now hands the wait back to the caller; measured on a
+  T23 while moving, the longest push gap around a PONG went from ~2050 ms to
+  ~220 ms (`ws://` and `wss://`). A fragmented message whose rest never arrives
+  is now a torn frame (close 1011) rather than a silent restart of the wait.
 - **The handshake timeout was not a real deadline.** The 5 s budget was passed to
   every `poll()` unchanged, so a client dribbling one byte just under the timeout
   could hold a pre-auth connection - and one of the four listener slots - open

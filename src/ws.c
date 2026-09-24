@@ -587,20 +587,30 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
    * assembling the rest. Still a bound, and still one for the WHOLE message
    * including any continuation frames, so a slow-loris peer gains at most
    * WS_ASSEMBLY_TIMEOUT_MS and cannot reset the clock by dribbling - the switch
-   * happens once per call, not once per frame. */
-  long long deadline = ws_now_ms() + timeout_ms;
-  bool assembling = false;
+   * happens once per call, not once per frame.
+   *
+   * The assembly budget covers a MESSAGE, though, not everything that follows
+   * the first header. A control frame is a message of its own: once a PING or
+   * PONG has been handled and no data message is half-assembled, the wait for
+   * the next header is the caller's again. Carrying the assembly budget past
+   * it turned every keepalive PONG into a 2 s stall of a 150 ms push cadence.
+   */
+  long long wait_deadline = ws_now_ms() + timeout_ms;
+  long long asm_deadline = 0; /* set by the first header of this call */
 
   for (;;) {
     unsigned char h[2];
-    int rc = read_exact(c->io, h, 2, deadline);
+    /* Mid-message the next header is part of the assembly; otherwise it is
+     * the start of a new message and the caller's wait governs it. */
+    long long hdr_deadline = c->frag_op ? asm_deadline : wait_deadline;
+    int rc = read_exact(c->io, h, 2, hdr_deadline);
+    if (rc == WS_AGAIN && c->frag_op)
+      return WS_EIO; /* the rest of a fragmented message never came */
     if (rc != WS_OK)
-      return rc; /* WS_AGAIN here is benign: no frame had started */
+      return rc; /* WS_AGAIN here is benign: no message had started */
 
-    if (!assembling) {
-      assembling = true;
-      deadline = ws_now_ms() + WS_ASSEMBLY_TIMEOUT_MS;
-    }
+    if (!asm_deadline)
+      asm_deadline = ws_now_ms() + WS_ASSEMBLY_TIMEOUT_MS;
 
     bool fin = (h[0] & 0x80) != 0;
     int rsv = h[0] & 0x70;
@@ -625,12 +635,12 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
       unsigned char e[2];
       /* Once a header has started, a timeout means a torn frame - read_exact
        * turns that into WS_EIO for us. */
-      if ((rc = read_exact(c->io, e, 2, deadline)) != WS_OK)
+      if ((rc = read_exact(c->io, e, 2, asm_deadline)) != WS_OK)
         return (rc == WS_AGAIN) ? WS_EIO : rc;
       plen = ((uint64_t)e[0] << 8) | e[1];
     } else if (plen == 127) {
       unsigned char e[8];
-      if ((rc = read_exact(c->io, e, 8, deadline)) != WS_OK)
+      if ((rc = read_exact(c->io, e, 8, asm_deadline)) != WS_OK)
         return (rc == WS_AGAIN) ? WS_EIO : rc;
       plen = 0;
       for (int i = 0; i < 8; i++)
@@ -650,12 +660,12 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
       return WS_ETOOBIG;
 
     unsigned char mask[4];
-    if ((rc = read_exact(c->io, mask, 4, deadline)) != WS_OK)
+    if ((rc = read_exact(c->io, mask, 4, asm_deadline)) != WS_OK)
       return (rc == WS_AGAIN) ? WS_EIO : rc;
 
     unsigned char payload[WS_MAX_PAYLOAD];
     if (plen > 0) {
-      if ((rc = read_exact(c->io, payload, (size_t)plen, deadline)) != WS_OK)
+      if ((rc = read_exact(c->io, payload, (size_t)plen, asm_deadline)) != WS_OK)
         return (rc == WS_AGAIN) ? WS_EIO : rc;
       for (uint64_t i = 0; i < plen; i++)
         payload[i] ^= mask[i & 3];
@@ -707,7 +717,7 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
     }
 
     if (!fin)
-      continue; /* wait for the rest, under the same deadline */
+      continue; /* wait for the rest, under the assembly deadline */
 
     if (c->frag_len >= cap)
       return WS_ETOOBIG;
