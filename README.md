@@ -404,7 +404,8 @@ preset, so it is set explicitly; 3.x already defaults there).
 - **One shared status sample** (40 ms) for all subscribed clients instead of
   one ioctl plus lock attempt per client, invalidated after every command.
 - **Less copying and stack per frame:** payloads are read straight into the
-  reassembly buffer (the 2 KB per-call stack copy is gone).
+  reassembly buffer (the 2 KB per-call stack copy is gone); the rate limiter
+  uses integer milli-tokens instead of `double`.
 - **Thread stacks:** every thread goes through one helper,
   `motor_spawn_detached()`; the listener thread is bounded too now, and
   connection threads get 128 KB when wss:// is available (measured 16 KB used

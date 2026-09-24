@@ -169,8 +169,9 @@ typedef struct {
   long long last_sent_ms; /* when a status frame last went out */
   long long last_ping_ms;
 
-  /* token bucket */
-  double tokens;
+  /* token bucket, in thousandths of a command: integer arithmetic keeps the
+   * per-command check off the FPU emulation path and out of the binary */
+  long long tokens_milli;
   long long bucket_ms;
   int strikes;
 
@@ -868,16 +869,17 @@ out:
  * command should be dropped. */
 static bool rate_ok(ws_client *c) {
   long long now = now_ms();
-  double elapsed = (double)(now - c->bucket_ms) / 1000.0;
+  long long cap = (long long)g_cfg.rate_limit * 1000;
 
+  /* rate_limit commands per second = rate_limit milli-tokens per ms */
+  c->tokens_milli += (now - c->bucket_ms) * (long long)g_cfg.rate_limit;
   c->bucket_ms = now;
-  c->tokens += elapsed * (double)g_cfg.rate_limit;
-  if (c->tokens > (double)g_cfg.rate_limit)
-    c->tokens = (double)g_cfg.rate_limit;
+  if (c->tokens_milli > cap)
+    c->tokens_milli = cap;
 
-  if (c->tokens < 1.0)
+  if (c->tokens_milli < 1000)
     return false;
-  c->tokens -= 1.0;
+  c->tokens_milli -= 1000;
   return true;
 }
 
@@ -1167,7 +1169,7 @@ static void *conn_thread(void *arg) {
          c->local ? " (loopback)" : "");
 
   ws_conn_init(&c->ws, &c->io);
-  c->tokens = (double)g_cfg.rate_limit;
+  c->tokens_milli = (long long)g_cfg.rate_limit * 1000;
   c->bucket_ms = now_ms();
   c->last_ping_ms = c->bucket_ms;
   c->last_poll_ms = c->last_sent_ms = c->bucket_ms;
