@@ -396,7 +396,7 @@ preset, so it is set explicitly; 3.x already defaults there).
   retries.
 - **Smaller fixes.** A JSON number outside `long long`'s range (`1e300`,
   `-1e999`) was converted with undefined behaviour and is now saturated, so it
-  fails the range check.
+  fails the range check; the nesting guard can no longer go negative.
 - **The handshake timeout was not a real deadline.** The 5 s budget was passed to
   every `poll()` unchanged, so a client dribbling one byte just under the timeout
   could hold a pre-auth connection - and one of the four listener slots - open

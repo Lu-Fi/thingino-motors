@@ -641,7 +641,12 @@ static bool json_nesting_too_deep(const char *text) {
       if (++depth > JSON_MAX_NEST_DEPTH)
         return true;
     } else if (*p == '}' || *p == ']') {
-      depth--;
+      /* Never below zero: a run of unmatched closers must not bank credit
+       * for a deeper run of openers after it. libjct stops at the first
+       * unmatched closer anyway, so this is not reachable today - it keeps
+       * the guard correct on its own terms rather than by the parser's. */
+      if (depth > 0)
+        depth--;
     }
   }
   return false;
