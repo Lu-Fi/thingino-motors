@@ -2651,14 +2651,47 @@ static void daemonsetup() {
   /* Change the working directory */
   chdir("/dev/");
 
-  /* Close all open file descriptors */
+  /* Close all open file descriptors.
+   *
+   * closelog() first: main() has already logged by now, so libc holds the
+   * syslog socket's fd number. Closing that fd behind libc's back leaves it
+   * believing the number is still its socket; the next syslog() fails to send
+   * on whatever has been opened there since, and libc's recovery CLOSES that
+   * descriptor and reconnects. Once 0-2 are taken by /dev/null below, the
+   * first free number - the one libc remembers - is where /dev/motor lands,
+   * and every ioctl after the first log line then hits a socket. openlog()
+   * at the end of this function starts libc over cleanly.
+   *
+   * The log mask is saved around it: uClibc's closelog() also resets the mask
+   * to "everything", which would undo configure_logmask() and put every
+   * LOG_DEBUG line of a non-debug daemon into the camera's small syslog ring.
+   * setlogmask(0) reads the mask without changing it. */
+  int logmask = setlogmask(0);
+  closelog();
   int x;
   for (x = sysconf(_SC_OPEN_MAX); x >= 0; x--) {
     close(x);
   }
 
+  /* ...and put /dev/null back on 0, 1 and 2. Left closed, they are simply the
+   * next numbers open() and socket() hand out, while libjct keeps writing
+   * diagnostics to stderr - on every malformed JSON a WebSocket client sends
+   * ("Error: Invalid JSON string provided"). Those bytes then land in
+   * whichever descriptor currently owns fd 2: a listening socket, the syslog
+   * connection, or a live client connection whose stream they corrupt. The
+   * fds are all free here, so open() returns 0 and the dup2()s fill 1 and 2. */
+  x = open("/dev/null", O_RDWR);
+  if (x >= 0) {
+    dup2(x, STDIN_FILENO);
+    dup2(x, STDOUT_FILENO);
+    dup2(x, STDERR_FILENO);
+    if (x > STDERR_FILENO)
+      close(x);
+  }
+
   /* Open the log file */
   openlog("motors-daemon", LOG_PID, LOG_DAEMON);
+  setlogmask(logmask);
 }
 
 void requestcleanup() {

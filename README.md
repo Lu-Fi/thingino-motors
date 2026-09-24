@@ -394,6 +394,15 @@ preset, so it is set explicitly; 3.x already defaults there).
 - **A transient `accept()` error closed the listener for good** (EMFILE,
   ENOBUFS, EPROTO, ...). The WebSocket listener now backs off 200 ms and
   retries.
+- **stdin/stdout/stderr were left closed after daemonizing.** libjct prints to
+  stderr on every malformed JSON, so those bytes went to whichever descriptor
+  held fd 2 - on the cameras checked, the WS listening socket, where they were
+  dropped, but a client connection could have held it. 0-2 now point at
+  `/dev/null`. Doing that exposed a latent bug: `main()` logs before
+  daemonizing, and closing libc's syslog fd behind its back made its error
+  recovery later close whatever reused that number - which became `/dev/motor`.
+  `closelog()` now runs first, and the log mask (which uClibc's `closelog()`
+  resets) is preserved.
 - **Smaller fixes.** A JSON number outside `long long`'s range (`1e300`,
   `-1e999`) was converted with undefined behaviour and is now saturated, so it
   fails the range check; the nesting guard can no longer go negative; an `R`
