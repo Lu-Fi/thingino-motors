@@ -372,6 +372,9 @@ preset, so it is set explicitly; 3.x already defaults there).
   non-blocking and `write_all()` has one 10 s deadline for the whole buffer; a
   stalled reader is dropped (measured: 24 s from the first unread byte, of which
   ~14 s filling the buffers).
+- **A transient `accept()` error closed the listener for good** (EMFILE,
+  ENOBUFS, EPROTO, ...). The WebSocket listener now backs off 200 ms and
+  retries.
 - **The handshake timeout was not a real deadline.** The 5 s budget was passed to
   every `poll()` unchanged, so a client dribbling one byte just under the timeout
   could hold a pre-auth connection - and one of the four listener slots - open

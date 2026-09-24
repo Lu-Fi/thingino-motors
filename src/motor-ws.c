@@ -1113,8 +1113,23 @@ static void *listen_thread(void *arg) {
     if (fd < 0) {
       if (errno == EINTR || errno == ECONNABORTED)
         continue;
-      syslog(LOG_ERR, "ws: accept failed: %s", strerror(errno));
-      break;
+      /* Everything else accept() reports on a listening socket that is
+       * still valid is a resource shortage (EMFILE, ENFILE, ENOBUFS, ENOMEM)
+       * or a connection that died in the backlog (EPROTO, and the network
+       * errors Linux passes through). All of them clear on their own. This
+       * loop used to break out on any of them, which closed the listener
+       * for good - WebSocket control gone until a daemon restart, with one
+       * syslog line as the only trace. Back off and keep serving; only a
+       * socket that is itself broken ends the thread. */
+      if (errno == EBADF || errno == EINVAL || errno == ENOTSOCK ||
+          errno == EOPNOTSUPP) {
+        syslog(LOG_ERR, "ws: accept failed: %s, listener stopped",
+               strerror(errno));
+        break;
+      }
+      syslog(LOG_WARNING, "ws: accept failed: %s, retrying", strerror(errno));
+      usleep(200 * 1000);
+      continue;
     }
 
     pthread_mutex_lock(&g_count_lock);
