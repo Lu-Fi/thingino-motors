@@ -354,6 +354,52 @@ static int send_ack(ws_client *c, long long id, const char *cmd, bool have_xy,
  * status sampling
  * ------------------------------------------------------------------ */
 
+/* Every subscribed connection used to sample the driver on its own cadence -
+ * four clients at 150 ms meant four MOTOR_GET_STATUS ioctls and four
+ * command-lock attempts where one would do, and each attempt that lands
+ * during a command is a skipped push. One shared sample, reused while it is
+ * younger than this, collapses them. Below the 50 ms push floor, so no client
+ * ever receives a sample older than its own interval. */
+#define WS_STATUS_CACHE_MS 40
+
+static pthread_mutex_t g_status_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct motor_message g_status;
+static long long g_status_ms;
+static bool g_status_valid;
+
+/* A command has just changed things: the next sample must come from the
+ * driver, not from before the command - that is the whole point of the
+ * forced poll in conn_thread(). */
+static void status_invalidate(void) {
+  pthread_mutex_lock(&g_status_lock);
+  g_status_valid = false;
+  pthread_mutex_unlock(&g_status_lock);
+}
+
+/* Non-blocking sample for the periodic push (see motor_ctl_status_try()).
+ * Returns false when the driver could not be asked right now. */
+static bool status_sample(struct motor_message *m) {
+  long long now = now_ms();
+
+  pthread_mutex_lock(&g_status_lock);
+  if (g_status_valid && now - g_status_ms < WS_STATUS_CACHE_MS) {
+    *m = g_status;
+    pthread_mutex_unlock(&g_status_lock);
+    return true;
+  }
+  pthread_mutex_unlock(&g_status_lock);
+
+  if (!motor_ctl_status_try(m))
+    return false;
+
+  pthread_mutex_lock(&g_status_lock);
+  g_status = *m;
+  g_status_ms = now;
+  g_status_valid = true;
+  pthread_mutex_unlock(&g_status_lock);
+  return true;
+}
+
 /* Status for a frame the client is owed right now - the "hello" greeting and
  * an explicit "status" command. Those used to take the command lock
  * unconditionally, which parks the connection thread for the whole of a
@@ -855,7 +901,7 @@ static int periodic(ws_client *c) {
      * frontend's long command holds the lock. Leaving last_poll_ms alone on
      * a skip means the next attempt comes one read-timeout later, not in a
      * spin. */
-    if (!motor_ctl_status_try(&m))
+    if (!status_sample(&m))
       goto keepalive;
     moving = (m.status == MOTOR_IS_RUNNING);
 
@@ -1213,8 +1259,11 @@ static void *conn_thread(void *arg) {
      * periodic()'s change detection for the commands that changed nothing -
      * a ping, a move clamped to zero, a vector update against a travel limit
      * the camera is already parked on. Every command already answers with its
-     * own ack or error, so there is no reply owed here. */
+     * own ack or error, so there is no reply owed here. The shared sample is
+     * dropped as well, or the forced poll would be answered from before the
+     * command. */
     c->last_poll_ms = 0;
+    status_invalidate();
 
     {
       int prc = periodic(c);

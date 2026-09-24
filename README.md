@@ -401,6 +401,8 @@ preset, so it is set explicitly; 3.x already defaults there).
 
 ### Changed on this branch
 
+- **One shared status sample** (40 ms) for all subscribed clients instead of
+  one ioctl plus lock attempt per client, invalidated after every command.
 - **Less copying and stack per frame:** payloads are read straight into the
   reassembly buffer (the 2 KB per-call stack copy is gone).
 - **Thread stacks:** every thread goes through one helper,
