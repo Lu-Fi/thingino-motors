@@ -659,16 +659,35 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
     if (plen > WS_MAX_PAYLOAD)
       return WS_ETOOBIG;
 
+    /* Where the payload lands, decided BEFORE reading it: a control payload
+     * into a 125-byte scratch buffer, a data payload straight onto the end of
+     * the reassembly buffer. The fragment-state checks therefore run first -
+     * they used to run after a full-size stack copy of a payload that was
+     * then thrown away with the connection. */
+    unsigned char ctl[125];
+    unsigned char *dst = ctl;
+    if (!is_control) {
+      if (op == WS_OP_CONT) {
+        if (c->frag_op == 0)
+          return WS_EPROTO; /* continuation with nothing to continue */
+      } else if (c->frag_op != 0) {
+        return WS_EPROTO; /* new message started mid-fragment */
+      }
+      size_t base = (op == WS_OP_CONT) ? c->frag_len : 0;
+      if (base + (size_t)plen > sizeof(c->frag))
+        return WS_ETOOBIG;
+      dst = c->frag + base;
+    }
+
     unsigned char mask[4];
     if ((rc = read_exact(c->io, mask, 4, asm_deadline)) != WS_OK)
       return (rc == WS_AGAIN) ? WS_EIO : rc;
 
-    unsigned char payload[WS_MAX_PAYLOAD];
     if (plen > 0) {
-      if ((rc = read_exact(c->io, payload, (size_t)plen, asm_deadline)) != WS_OK)
+      if ((rc = read_exact(c->io, dst, (size_t)plen, asm_deadline)) != WS_OK)
         return (rc == WS_AGAIN) ? WS_EIO : rc;
       for (uint64_t i = 0; i < plen; i++)
-        payload[i] ^= mask[i & 3];
+        dst[i] ^= mask[i & 3];
     }
 
     /* Liveness stamp. Deliberately here and not at the top of the loop: only a
@@ -682,12 +701,12 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
     if (is_control) {
       /* Handled here so the caller's command loop never sees the control
        * plane. A PING may arrive in the middle of a fragmented message, and
-       * answering it must not disturb c->frag - it does not, because the
-       * reassembly state is only touched on the data path below. */
+       * answering it must not disturb c->frag - it does not, because a
+       * control payload never lands there. */
       if (op == WS_OP_CLOSE)
         return WS_CLOSED;
       if (op == WS_OP_PING) {
-        if (ws_send_frame(c->io, WS_OP_PONG, payload, (size_t)plen) != WS_OK)
+        if (ws_send_frame(c->io, WS_OP_PONG, ctl, (size_t)plen) != WS_OK)
           return WS_EIO;
       }
       /* WS_OP_PONG: nothing further to do - the stamp above is the whole
@@ -698,23 +717,12 @@ int ws_read_message(ws_conn *c, int *opcode, unsigned char *out, size_t cap,
       continue;
     }
 
-    /* --- data frame --- */
-    if (op == WS_OP_CONT) {
-      if (c->frag_op == 0)
-        return WS_EPROTO; /* continuation with nothing to continue */
-    } else {
-      if (c->frag_op != 0)
-        return WS_EPROTO; /* new message started mid-fragment */
+    /* --- data frame: the payload is already in place --- */
+    if (op != WS_OP_CONT) {
       c->frag_op = op;
       c->frag_len = 0;
     }
-
-    if (c->frag_len + (size_t)plen > sizeof(c->frag))
-      return WS_ETOOBIG;
-    if (plen > 0) {
-      memcpy(c->frag + c->frag_len, payload, (size_t)plen);
-      c->frag_len += (size_t)plen;
-    }
+    c->frag_len += (size_t)plen;
 
     if (!fin)
       continue; /* wait for the rest, under the assembly deadline */

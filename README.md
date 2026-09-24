@@ -368,6 +368,11 @@ preset, so it is set explicitly; 3.x already defaults there).
   could hold a pre-auth connection - and one of the four listener slots - open
   forever. The time remaining is now re-derived from the clock before each poll.
 
+### Changed on this branch
+
+- **Less copying and stack per frame:** payloads are read straight into the
+  reassembly buffer (the 2 KB per-call stack copy is gone).
+
 ### Building
 
 The listener is on by default in this repo's Makefile and can be turned off:
