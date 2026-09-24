@@ -10,14 +10,51 @@
  * value "does not provide any security" - it exists so that a caching proxy
  * or a non-WebSocket server cannot accidentally produce a response that looks
  * like a successful upgrade. SHA-1's collision weakness is irrelevant to that
- * job, and no library alternative is reachable here (this daemon links only
- * libjct).
+ * job. A build without wss:// links only libjct, so there is no library
+ * alternative to reach for; a TLS build has mbedcrypto and uses it instead
+ * (see below).
  *
  * Anything that IS a security boundary - the /ws access token - goes through
  * ws_token.c / sha256.c instead and never touches this code. The two are kept
  * in separate translation units so that "which hash is this?" is answerable
  * by looking at the #include list of the caller.
  */
+
+#ifdef MOTORS_WS_TLS
+
+/* TLS build: mbedcrypto is linked anyway, so reuse its SHA-1 instead of
+ * carrying a second copy (see sha1.h). 3.x dropped the _ret suffix that 2.x
+ * used for the error-returning variants; neither can fail for in-memory
+ * input, so the result is not checked. */
+#include <mbedtls/version.h>
+
+#include "sha1.h"
+
+#if MBEDTLS_VERSION_MAJOR >= 3
+#define SHA1_STARTS mbedtls_sha1_starts
+#define SHA1_UPDATE mbedtls_sha1_update
+#define SHA1_FINISH mbedtls_sha1_finish
+#else
+#define SHA1_STARTS mbedtls_sha1_starts_ret
+#define SHA1_UPDATE mbedtls_sha1_update_ret
+#define SHA1_FINISH mbedtls_sha1_finish_ret
+#endif
+
+void sha1_init(sha1_ctx *ctx) {
+  mbedtls_sha1_init(ctx);
+  (void)SHA1_STARTS(ctx);
+}
+
+void sha1_update(sha1_ctx *ctx, const unsigned char *data, size_t len) {
+  (void)SHA1_UPDATE(ctx, data, len);
+}
+
+void sha1_final(sha1_ctx *ctx, unsigned char digest[20]) {
+  (void)SHA1_FINISH(ctx, digest);
+  mbedtls_sha1_free(ctx);
+}
+
+#else /* !MOTORS_WS_TLS */
 
 #include <string.h>
 
@@ -149,3 +186,5 @@ void sha1_final(sha1_ctx *ctx, unsigned char digest[20]) {
    * matter */
   memset(ctx, 0, sizeof(*ctx));
 }
+
+#endif /* MOTORS_WS_TLS */

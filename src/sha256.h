@@ -14,12 +14,18 @@
 
 #define SHA256_DIGEST_LEN 32
 
+#ifdef MOTORS_WS_TLS
+/* See sha1.h: with mbedcrypto linked anyway, these wrap its SHA-256. */
+#include <mbedtls/sha256.h>
+typedef mbedtls_sha256_context sha256_ctx;
+#else
 typedef struct {
   uint32_t state[8];
   uint64_t bitlen;
   unsigned char buf[64];
   size_t buf_len;
 } sha256_ctx;
+#endif
 
 void sha256_init(sha256_ctx *ctx);
 void sha256_update(sha256_ctx *ctx, const unsigned char *data, size_t len);

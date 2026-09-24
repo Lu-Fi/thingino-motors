@@ -446,6 +446,9 @@ make WS=0            # no listener, no token store, ~25 KB less text
 make check           # SHA-1/SHA-256/base64/framing self-test, host build, no libjct
 ```
 
+With `WS_TLS=1`, `sha1.c`/`sha256.c` become thin wrappers over mbedcrypto; the
+self-test builds without TLS and keeps covering the bundled implementations.
+
 `WS_TLS` is off by default because mbedTLS is the only dependency in this tree
 beyond libjct, and a plain `make` on a development host has to keep working
 without it. The thingino package that consumes this tree compiles the sources

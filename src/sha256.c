@@ -1,6 +1,47 @@
 /* Minimal SHA-256 (FIPS 180-4), used only by ws_token.c. See sha256.h for
  * why this lives apart from sha1.c. */
 
+#ifdef MOTORS_WS_TLS
+
+/* TLS build: wrap mbedcrypto's SHA-256; see sha1.c for the version guard. */
+#include <mbedtls/version.h>
+
+#include "sha256.h"
+
+#if MBEDTLS_VERSION_MAJOR >= 3
+#define SHA256_STARTS mbedtls_sha256_starts
+#define SHA256_UPDATE mbedtls_sha256_update
+#define SHA256_FINISH mbedtls_sha256_finish
+#else
+#define SHA256_STARTS mbedtls_sha256_starts_ret
+#define SHA256_UPDATE mbedtls_sha256_update_ret
+#define SHA256_FINISH mbedtls_sha256_finish_ret
+#endif
+
+void sha256_init(sha256_ctx *ctx) {
+  mbedtls_sha256_init(ctx);
+  (void)SHA256_STARTS(ctx, 0); /* 0 = SHA-256, not SHA-224 */
+}
+
+void sha256_update(sha256_ctx *ctx, const unsigned char *data, size_t len) {
+  (void)SHA256_UPDATE(ctx, data, len);
+}
+
+void sha256_final(sha256_ctx *ctx, unsigned char digest[SHA256_DIGEST_LEN]) {
+  (void)SHA256_FINISH(ctx, digest);
+  mbedtls_sha256_free(ctx);
+}
+
+void sha256(const void *data, size_t len,
+            unsigned char digest[SHA256_DIGEST_LEN]) {
+  sha256_ctx ctx;
+  sha256_init(&ctx);
+  sha256_update(&ctx, (const unsigned char *)data, len);
+  sha256_final(&ctx, digest);
+}
+
+#else /* !MOTORS_WS_TLS */
+
 #include <string.h>
 
 #include "sha256.h"
@@ -146,3 +187,5 @@ void sha256(const void *data, size_t len,
   sha256_update(&ctx, (const unsigned char *)data, len);
   sha256_final(&ctx, digest);
 }
+
+#endif /* MOTORS_WS_TLS */

@@ -11,12 +11,21 @@
  * signatures, token storage) - for those see ws_token.h, which never hashes
  * with this. */
 
+#ifdef MOTORS_WS_TLS
+/* A TLS build links mbedcrypto, which already carries SHA-1; the functions
+ * below are then thin wrappers over it and the hand-rolled rounds in sha1.c
+ * are compiled out. The self-test builds without MOTORS_WS_TLS and keeps
+ * checking the hand-rolled path. */
+#include <mbedtls/sha1.h>
+typedef mbedtls_sha1_context sha1_ctx;
+#else
 typedef struct {
   uint32_t state[5];
   uint64_t bitlen;
   unsigned char buf[64];
   size_t buf_len;
 } sha1_ctx;
+#endif
 
 void sha1_init(sha1_ctx *ctx);
 void sha1_update(sha1_ctx *ctx, const unsigned char *data, size_t len);
