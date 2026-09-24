@@ -394,6 +394,9 @@ preset, so it is set explicitly; 3.x already defaults there).
 - **A transient `accept()` error closed the listener for good** (EMFILE,
   ENOBUFS, EPROTO, ...). The WebSocket listener now backs off 200 ms and
   retries.
+- **Smaller fixes.** A JSON number outside `long long`'s range (`1e300`,
+  `-1e999`) was converted with undefined behaviour and is now saturated, so it
+  fails the range check.
 - **The handshake timeout was not a real deadline.** The 5 s budget was passed to
   every `poll()` unchanged, so a client dribbling one byte just under the timeout
   could hold a pre-auth connection - and one of the four listener slots - open

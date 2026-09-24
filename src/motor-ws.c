@@ -577,9 +577,25 @@ static bool json_int(JsonValue *obj, const char *key, long long *out) {
   if (!v)
     return false;
   if (v->type == JSON_NUMBER) {
-    *out = (v->value.number.kind == JSON_NUMBER_INT)
-               ? (long long)v->value.number.integer
-               : (long long)v->value.number.real;
+    if (v->value.number.kind == JSON_NUMBER_INT) {
+      *out = (long long)v->value.number.integer;
+      return true;
+    }
+    /* Converting a double outside long long's range (1e300, or the infinity
+     * that "1e999" parses to) is undefined behaviour, not a large number.
+     * Saturate first, well beyond every range check the callers apply, so
+     * such a value is rejected as out of range rather than turning into
+     * whatever the conversion happens to produce. NaN compares false both
+     * ways and is refused outright. */
+    double r = v->value.number.real;
+    const double lim = 9007199254740992.0; /* 2^53 */
+    if (r != r)
+      return false;
+    if (r > lim)
+      r = lim;
+    if (r < -lim)
+      r = -lim;
+    *out = (long long)r;
     return true;
   }
   return false;
