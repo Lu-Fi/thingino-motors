@@ -338,11 +338,14 @@ preset, so it is set explicitly; 3.x already defaults there).
 - Rate limit is a token bucket at `ws_rate_limit` commands/s per connection
   (a UI holding a button runs at ~11/s); 50 throttled commands closes the
   connection with 1008.
-- `ws_max_clients` connections are accepted, further ones get an immediate
-  plaintext 503 - no TLS handshake is run just to refuse someone.
-- Pre-auth connections are bounded: 5 s for the HTTP handshake, 15 s for the TLS
-  one, and connection threads get a 64 KB stack (128 KB when wss:// is
-  available) rather than the default megabytes.
+- `ws_max_clients` counts authenticated connections only; one more gets a 503
+  after it authenticated, over its own transport.
+- Connections that have not authenticated yet have a separate budget of 4. When
+  it is full the oldest one (if older than 500 ms) is dropped to make room, so
+  sockets that open and then dribble cannot lock real clients out. Each is also
+  bounded in time: 5 s for the HTTP handshake, 15 s for the TLS one. Connection
+  threads get a 64 KB stack (128 KB when wss:// is available) rather than the
+  default megabytes.
 - Writes are bounded too: every socket is non-blocking, and a frame that cannot
   be written within 10 s closes the connection instead of parking its thread
   in `send()` until TCP gives up.
@@ -372,6 +375,13 @@ preset, so it is set explicitly; 3.x already defaults there).
   non-blocking and `write_all()` has one 10 s deadline for the whole buffer; a
   stalled reader is dropped (measured: 24 s from the first unread byte, of which
   ~14 s filling the buffers).
+- **Idle unauthenticated sockets could lock every client out.** They counted
+  against `ws_max_clients`, so four sockets that open and dribble - re-opened as
+  soon as they are dropped - got every real client a 503. Handshakes now have
+  their own budget of 4, and when it is full the oldest one (older than 500 ms)
+  is evicted. `ws_max_clients` counts authenticated connections, and the 503
+  for a full house is sent after authentication over the client's own
+  transport. The listener no longer lingers 500 ms on each refusal.
 - **A transient `accept()` error closed the listener for good** (EMFILE,
   ENOBUFS, EPROTO, ...). The WebSocket listener now backs off 200 ms and
   retries.

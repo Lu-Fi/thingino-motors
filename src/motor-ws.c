@@ -114,12 +114,40 @@ static motor_ws_cfg g_cfg;
 static ws_tls_ctx *g_tls;
 #endif
 
-/* Live connection count, guarded by g_count_lock. A plain int + mutex rather
+/* Connections that have not authenticated yet: TLS handshake, HTTP upgrade,
+ * Origin and token check. They get their own small budget, separate from
+ * ws_max_clients, because they used to share it: four sockets that open and
+ * then dribble - each held up to WS_TLS_HANDSHAKE_TIMEOUT_MS, re-opened as
+ * soon as it is dropped - locked every legitimate client out while holding
+ * no credential at all.
+ *
+ * When the table is full the OLDEST entry is evicted (shutdown() on its
+ * socket, which wakes its poll and ends it within one read) rather than the
+ * newcomer refused, so a flood can delay a real client but cannot keep it
+ * out: a browser finishes its handshake in well under a second, an attacker
+ * has to keep beating that to stay ahead. The minimum age stops a burst of
+ * genuine reconnects - four PTZ tabs after a daemon restart - from evicting
+ * each other before any of them had a chance. */
+#define WS_MAX_PENDING 4
+#define WS_PENDING_MIN_AGE_MS 500
+
+/* Live connection counts, guarded by g_count_lock. A plain int + mutex rather
  * than an atomic builtin: this has to build on whatever the buildroot
  * toolchain provides for MIPS32, and the accept path is not hot enough for
- * the difference to matter. */
+ * the difference to matter.
+ *
+ * g_nclients counts AUTHENTICATED connections only - the ones ws_max_clients
+ * is about. g_pending[] holds the fd of each connection still in its
+ * handshake (-1 = free slot). An entry is removed by its own thread, under the
+ * lock, BEFORE that thread closes the fd: the listener's shutdown() of an
+ * evicted fd, also under the lock, can therefore never reach a descriptor
+ * number that has since been reused by another connection. */
 static pthread_mutex_t g_count_lock = PTHREAD_MUTEX_INITIALIZER;
 static int g_nclients = 0;
+static struct {
+  int fd;
+  long long since;
+} g_pending[WS_MAX_PENDING];
 
 /* Homing is the one command that runs for tens of seconds while holding the
  * command mutex. It is dispatched to its own thread so the WS connection
@@ -145,6 +173,8 @@ typedef struct {
   double tokens;
   long long bucket_ms;
   int strikes;
+
+  bool authed; /* counted in g_nclients rather than g_pending[] */
 
   /* last pushed sample, so an idle connection stays silent */
   int last_x, last_y, last_moving;
@@ -184,6 +214,46 @@ static int clampi(int v, int lo, int hi) {
  * decides plain vs TLS runs on the thread itself, hence one size for all. */
 #define WS_STACK_PLAIN (64 * 1024)
 #define WS_STACK_TLS (128 * 1024)
+
+/* Lowest-numbered-first scan is fine for a table of four. Returns the slot
+ * index, or -1 when the table is full and nothing in it is old enough to
+ * evict. Called with g_count_lock held. */
+static int pending_claim_locked(int fd, long long now) {
+  int oldest = -1;
+
+  for (int i = 0; i < WS_MAX_PENDING; i++) {
+    if (g_pending[i].fd < 0) {
+      g_pending[i].fd = fd;
+      g_pending[i].since = now;
+      return i;
+    }
+    if (oldest < 0 || g_pending[i].since < g_pending[oldest].since)
+      oldest = i;
+  }
+
+  if (now - g_pending[oldest].since < WS_PENDING_MIN_AGE_MS)
+    return -1;
+
+  /* The evicted thread still owns its fd and will find it missing from the
+   * table when it comes to release it - which is how it knows it was evicted
+   * rather than finished. */
+  shutdown(g_pending[oldest].fd, SHUT_RDWR);
+  g_pending[oldest].fd = fd;
+  g_pending[oldest].since = now;
+  return oldest;
+}
+
+/* Remove fd from the pending table. Returns false if it was no longer there,
+ * i.e. the listener evicted this connection. Called with g_count_lock held. */
+static bool pending_release_locked(int fd) {
+  for (int i = 0; i < WS_MAX_PENDING; i++) {
+    if (g_pending[i].fd == fd) {
+      g_pending[i].fd = -1;
+      return true;
+    }
+  }
+  return false;
+}
 
 #ifdef MOTORS_WS_TLS
 /* Wait for the socket to have at least one byte. Only used by the first-byte
@@ -795,11 +865,38 @@ keepalive:
   return WS_OK;
 }
 
-static void client_release(void) {
+/* Give back whichever budget this connection is counted in. Must run before
+ * the fd is closed - see g_pending[]. */
+static void client_release(ws_client *c) {
   pthread_mutex_lock(&g_count_lock);
-  if (g_nclients > 0)
-    g_nclients--;
+  if (c->authed) {
+    if (g_nclients > 0)
+      g_nclients--;
+  } else {
+    (void)pending_release_locked(c->io.fd);
+  }
   pthread_mutex_unlock(&g_count_lock);
+}
+
+/* Move a connection that has just authenticated from the pending table into
+ * the ws_max_clients budget. Returns 0 on success, -1 if the listener evicted
+ * it meanwhile (its socket is already shut down), -2 if every client slot is
+ * taken. On -2 the connection stays pending, so client_release() still frees
+ * its slot. */
+static int client_promote(ws_client *c) {
+  int rc = 0;
+
+  pthread_mutex_lock(&g_count_lock);
+  if (g_nclients >= g_cfg.max_clients) {
+    rc = -2;
+  } else if (!pending_release_locked(c->io.fd)) {
+    rc = -1;
+  } else {
+    g_nclients++;
+    c->authed = true;
+  }
+  pthread_mutex_unlock(&g_count_lock);
+  return rc;
 }
 
 /* How long the teardown will wait for the peer to acknowledge the close before
@@ -959,6 +1056,23 @@ static void *conn_thread(void *arg) {
     goto done;
   }
 
+  /* Only now does the connection count against ws_max_clients - and a full
+   * house is told so in a real HTTP response over whichever transport it
+   * came in on, instead of the bare close a wss:// client used to get from
+   * the listener. */
+  {
+    int prc = client_promote(c);
+    if (prc == -1)
+      goto done; /* evicted while authenticating; the socket is shut down */
+    if (prc == -2) {
+      syslog(LOG_WARNING, "ws: connection limit (%d) reached, rejecting %s",
+             g_cfg.max_clients, c->peer);
+      ws_handshake_reject(&c->io, 503, "Service Unavailable",
+                          "too many clients\n");
+      goto done;
+    }
+  }
+
   if (ws_handshake_accept(&c->io, &hs, NULL) != WS_OK)
     goto done;
 
@@ -1084,8 +1198,8 @@ done:
     c->io.tls = NULL;
   }
 #endif
+  client_release(c); /* before the close; see g_pending[] */
   close_gracefully(c->io.fd);
-  client_release();
   free(c);
   return NULL;
 }
@@ -1108,7 +1222,7 @@ static void *listen_thread(void *arg) {
     socklen_t plen = sizeof(peer);
     int fd = accept(lfd, (struct sockaddr *)&peer, &plen);
     ws_client *c;
-    int n;
+    int slot;
 
     if (fd < 0) {
       if (errno == EINTR || errno == ECONNABORTED)
@@ -1133,42 +1247,29 @@ static void *listen_thread(void *arg) {
     }
 
     pthread_mutex_lock(&g_count_lock);
-    n = g_nclients;
-    if (n < g_cfg.max_clients)
-      g_nclients++;
+    slot = pending_claim_locked(fd, now_ms());
     pthread_mutex_unlock(&g_count_lock);
 
-    if (n >= g_cfg.max_clients) {
-      char pbuf[INET_ADDRSTRLEN] = "?";
-      inet_ntop(AF_INET, &peer.sin_addr, pbuf, sizeof(pbuf));
-      /* Refuse politely and immediately rather than queueing. A camera has
-       * at most a handful of legitimate PTZ viewers; anything past the cap
-       * is either a bug or an attempt to exhaust thread stacks, and both are
-       * best answered with a closed socket. */
-      /* Deliberately plaintext even on a build that can serve wss://. This
-       * refusal happens before any TLS handshake - running one just to say
-       * "no" would hand an attacker a way to make the daemon do public-key
-       * work on demand, which is the opposite of what a connection cap is
-       * for. A wss:// client sees the connection close instead of reading the
-       * 503, and closing IS the message. */
-      ws_io rej = {.fd = fd, .tls = NULL};
-      ws_handshake_reject(&rej, 503, "Service Unavailable",
-                          "too many clients\n");
-      close_gracefully(fd);
-      syslog(LOG_WARNING, "ws: connection limit (%d) reached, rejecting %s",
-             g_cfg.max_clients, pbuf);
+    if (slot < 0) {
+      /* Every handshake slot is taken by a connection younger than
+       * WS_PENDING_MIN_AGE_MS. Close at once: no response, no linger - this
+       * is the listener thread, and a flood must not be able to slow the
+       * accept loop down by making it wait on each refusal. */
+      close(fd);
       continue;
     }
 
     c = calloc(1, sizeof(*c));
     if (!c) {
+      pthread_mutex_lock(&g_count_lock);
+      (void)pending_release_locked(fd);
+      pthread_mutex_unlock(&g_count_lock);
       close(fd);
-      client_release();
       continue;
     }
 
-    /* calloc() already zeroed io.tls; conn_thread() fills it in if this turns
-     * out to be a TLS client. */
+    /* calloc() already zeroed io.tls and authed; conn_thread() fills them in
+     * as the connection progresses. */
     c->io.fd = fd;
     c->local = ws_addr_is_loopback(ntohl(peer.sin_addr.s_addr));
     inet_ntop(AF_INET, &peer.sin_addr, c->peer, sizeof(c->peer));
@@ -1176,8 +1277,10 @@ static void *listen_thread(void *arg) {
 
     if (motor_spawn_detached(conn_thread, c, stack) != 0) {
       syslog(LOG_ERR, "ws: cannot spawn connection thread");
+      pthread_mutex_lock(&g_count_lock);
+      (void)pending_release_locked(fd);
+      pthread_mutex_unlock(&g_count_lock);
       close(fd);
-      client_release();
       free(c);
       continue;
     }
@@ -1355,6 +1458,8 @@ int motor_ws_start(motor_ws_cfg *cfg) {
    * become a divisor, a buffer size or a thread budget. */
   g_cfg.port = clampi(g_cfg.port, 1, 65535);
   g_cfg.max_clients = clampi(g_cfg.max_clients, 1, 32);
+  for (int i = 0; i < WS_MAX_PENDING; i++)
+    g_pending[i].fd = -1;
   g_cfg.rate_limit = clampi(g_cfg.rate_limit, 1, 500);
   g_cfg.push_ms = clampi(g_cfg.push_ms, 50, 5000);
 
