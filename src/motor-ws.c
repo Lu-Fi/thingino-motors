@@ -170,33 +170,20 @@ static int clampi(int v, int lo, int hi) {
   return (v < lo) ? lo : ((v > hi) ? hi : v);
 }
 
-/* Spawn a detached worker on a bounded stack. Nothing here is ever joined -
- * neither a connection thread nor a homing run - so detached is the shape.
- *
- * 64 KB because the deepest frame in this file is a connection thread's
- * handshake struct (~3.5 KB) plus one frame buffer; the pthread default would
- * be megabytes of address space per client, which is the wrong shape for a
- * device with 64 MB of RAM and a connection cap that exists specifically to
- * bound resource use. If the attribute cannot be set up, fall back to the
- * default rather than refusing the work. Returns 0 on success, -1 on failure. */
-static int spawn_detached(void *(*fn)(void *), void *arg) {
-  pthread_t tid;
-  pthread_attr_t attr;
-  pthread_attr_t *attrp = NULL;
-  int err;
-
-  if (pthread_attr_init(&attr) == 0) {
-    pthread_attr_setstacksize(&attr, 64 * 1024);
-    attrp = &attr;
-  }
-  err = pthread_create(&tid, attrp, fn, arg);
-  if (attrp)
-    pthread_attr_destroy(attrp);
-  if (err != 0)
-    return -1;
-  pthread_detach(tid);
-  return 0;
-}
+/* Stack for a connection thread. 64 KB covers the plain path: the deepest
+ * frame in this file is conn_thread() itself - the handshake struct (~3.5 KB)
+ * plus one message buffer - and libjct's recursion is capped by
+ * json_nesting_too_deep(). A wss:// connection additionally runs the mbedTLS
+ * handshake (bignum and ECP work, record buffers on the stack in places) on
+ * top of that frame. Measured on a T23 (2026-09-24, mbedTLS 3.6.6, TLS 1.3,
+ * ECDSA P-256 certificate): 16 KB of stack touched after the handshake. An
+ * RSA certificate's private-key operation was not measured and is heavier,
+ * so a TLS-capable listener still gives every connection thread 128 KB. It is
+ * address space, not RAM: only the pages a thread actually touches become
+ * resident, so the headroom costs nothing unless it is used. The sniff that
+ * decides plain vs TLS runs on the thread itself, hence one size for all. */
+#define WS_STACK_PLAIN (64 * 1024)
+#define WS_STACK_TLS (128 * 1024)
 
 #ifdef MOTORS_WS_TLS
 /* Wait for the socket to have at least one byte. Only used by the first-byte
@@ -656,7 +643,8 @@ static int handle_command(ws_client *c, const char *text) {
     /* Detached, because motor_ctl_home() is synchronous and can run for tens
      * of seconds; parking this connection thread on it would make "stop"
      * unreachable from the very client that started the home. */
-    if (spawn_detached(home_worker, (void *)(long)eff_speed) != 0) {
+    if (motor_spawn_detached(home_worker, (void *)(long)eff_speed,
+                             WS_STACK_PLAIN) != 0) {
       pthread_mutex_lock(&g_home_lock);
       g_home_running = false;
       pthread_mutex_unlock(&g_home_lock);
@@ -1108,6 +1096,12 @@ done:
 
 static void *listen_thread(void *arg) {
   int lfd = (int)(long)arg;
+  size_t stack = WS_STACK_PLAIN;
+
+#ifdef MOTORS_WS_TLS
+  if (g_tls)
+    stack = WS_STACK_TLS;
+#endif
 
   for (;;) {
     struct sockaddr_in peer;
@@ -1165,7 +1159,7 @@ static void *listen_thread(void *arg) {
     inet_ntop(AF_INET, &peer.sin_addr, c->peer, sizeof(c->peer));
     c->push_ms = 0;
 
-    if (spawn_detached(conn_thread, c) != 0) {
+    if (motor_spawn_detached(conn_thread, c, stack) != 0) {
       syslog(LOG_ERR, "ws: cannot spawn connection thread");
       close(fd);
       client_release();
@@ -1338,7 +1332,6 @@ static void tls_init(void) {
 
 int motor_ws_start(motor_ws_cfg *cfg) {
   struct sockaddr_in addr;
-  pthread_t tid;
   int lfd, one = 1;
 
   g_cfg = *cfg;
@@ -1406,7 +1399,10 @@ int motor_ws_start(motor_ws_cfg *cfg) {
   tls_init();
 #endif
 
-  if (pthread_create(&tid, NULL, listen_thread, (void *)(long)lfd) != 0) {
+  /* Bounded like every other thread here; the default would reserve
+   * megabytes of address space for a loop that holds a sockaddr. */
+  if (motor_spawn_detached(listen_thread, (void *)(long)lfd, WS_STACK_PLAIN) !=
+      0) {
     syslog(LOG_ERR, "ws: cannot spawn listener thread");
     close(lfd);
 #ifdef MOTORS_WS_TLS
@@ -1418,7 +1414,6 @@ int motor_ws_start(motor_ws_cfg *cfg) {
 #endif
     return -1;
   }
-  pthread_detach(tid);
 
 #ifdef MOTORS_WS_TLS
   if (g_tls) {

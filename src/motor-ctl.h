@@ -2,6 +2,7 @@
 #define MOTORS_MOTOR_CTL_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 /* The daemon's motor-control operations, as functions.
  *
@@ -161,5 +162,9 @@ void motor_ctl_invert(char axis);    /* 'I', axis in {'x','y','b'} */
 /* 'R' - reload /etc/thingino.json. Returns false if the reload failed (config
  * now at defaults). Fills out with fresh logical status. */
 bool motor_ctl_reload(struct motor_message *out);
+
+/* Spawn a detached thread on a bounded stack; 0 on success, -1 on failure.
+ * The one place this daemon creates threads, shared by both frontends. */
+int motor_spawn_detached(void *(*fn)(void *), void *arg, size_t stack_bytes);
 
 #endif /* MOTORS_MOTOR_CTL_H */

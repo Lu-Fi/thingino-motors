@@ -341,8 +341,8 @@ preset, so it is set explicitly; 3.x already defaults there).
 - `ws_max_clients` connections are accepted, further ones get an immediate
   plaintext 503 - no TLS handshake is run just to refuse someone.
 - Pre-auth connections are bounded: 5 s for the HTTP handshake, 15 s for the TLS
-  one, and connection threads get a 64 KB stack rather than the default
-  megabytes.
+  one, and connection threads get a 64 KB stack (128 KB when wss:// is
+  available) rather than the default megabytes.
 - Writes are bounded too: every socket is non-blocking, and a frame that cannot
   be written within 10 s closes the connection instead of parking its thread
   in `send()` until TCP gives up.
@@ -381,6 +381,10 @@ preset, so it is set explicitly; 3.x already defaults there).
 
 - **Less copying and stack per frame:** payloads are read straight into the
   reassembly buffer (the 2 KB per-call stack copy is gone).
+- **Thread stacks:** every thread goes through one helper,
+  `motor_spawn_detached()`; the listener thread is bounded too now, and
+  connection threads get 128 KB when wss:// is available (measured 16 KB used
+  with an ECDSA certificate; RSA was not measured).
 
 ### Building
 

@@ -781,6 +781,9 @@ static pthread_mutex_t motion_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int motion_generation = 0;
 static bool motion_cancelled = false;
 
+// Stack for every motion/stop/tracker thread; see motor_spawn_detached().
+#define WORKER_STACK (64 * 1024)
+
 // Forward declaration used by motor_steps() before definition below.
 #define WAIT_SUPERSEDED (-2)
 static int wait_until_idle(int timeout_ms, int poll_ms,
@@ -795,7 +798,6 @@ static void start_motion_active_tracker(void);
 static int get_motion_timeout_ms(void);
 static int chunk_timeout_ms(int steps, int speed, int floor_ms);
 static void physical_delta_to_steps(int *dx, int *dy);
-static int spawn_detached_worker(void *(*fn)(void *), void *arg);
 
 // Derive the default speed from the loaded config. Shared between startup
 // and the 'R' (reload) IPC command so both apply identical semantics.
@@ -1380,7 +1382,7 @@ static void request_motor_stop(void) {
 }
 
 static void start_stop_worker(void) {
-  if (spawn_detached_worker(stop_worker, NULL) != 0) {
+  if (motor_spawn_detached(stop_worker, NULL, WORKER_STACK) != 0) {
     syslog(LOG_ERR, "cannot start the motor-stop thread, stops will block");
     return;
   }
@@ -1479,22 +1481,23 @@ static int run_profiled_move(int xsteps, int ysteps, int requested_speed,
   return motion_is_cancelled(generation) ? -1 : 0;
 }
 
-/* Spawn a detached worker on a bounded 64 KB stack, the same convention the
- * WS listener uses for its connection threads (see spawn_detached() in
- * motor-ws.c). Nothing joins these. 64 KB is ample: the deepest chain from
- * here is run_profiled_move -> execute_profile_phase -> motor_steps_impl,
- * every frame a handful of scalars, measured at well under 1 KB in total. It
- * matters because a held joystick button dispatches ~11 moves a second, each
- * one a thread create+destroy, and the pthread default reserves megabytes of
- * address space for each. Returns 0 on success, -1 on failure. */
-static int spawn_detached_worker(void *(*fn)(void *), void *arg) {
+/* Spawn a detached worker on a bounded stack. Shared with motor-ws.c (see
+ * motor-ctl.h), so every thread this daemon creates follows one convention.
+ * Nothing joins these. 64 KB is ample for the motion workers: the deepest
+ * chain from here is run_profiled_move -> execute_profile_phase ->
+ * motor_steps_impl, every frame a handful of scalars, measured at well under
+ * 1 KB in total. It matters because the pthread default reserves megabytes of
+ * address space per thread on a 64 MB camera. If the attribute cannot be set
+ * up, fall back to the default rather than refusing the work. Returns 0 on
+ * success, -1 on failure. */
+int motor_spawn_detached(void *(*fn)(void *), void *arg, size_t stack_bytes) {
   pthread_t tid;
   pthread_attr_t attr;
   pthread_attr_t *attrp = NULL;
   int err;
 
   if (pthread_attr_init(&attr) == 0) {
-    pthread_attr_setstacksize(&attr, 64 * 1024);
+    pthread_attr_setstacksize(&attr, stack_bytes);
     attrp = &attr;
   }
   err = pthread_create(&tid, attrp, fn, arg);
@@ -1551,7 +1554,7 @@ static void *move_thread(void *arg) {
 }
 
 static void start_move_thread(void) {
-  if (spawn_detached_worker(move_thread, NULL) != 0) {
+  if (motor_spawn_detached(move_thread, NULL, WORKER_STACK) != 0) {
     syslog(LOG_ERR, "cannot start the motion thread, moves will run inline");
     return;
   }
@@ -2487,7 +2490,7 @@ static void *motion_active_tracker(void *arg) {
 
 static void start_motion_active_tracker() {
   write_motion_active_flag();
-  (void)spawn_detached_worker(motion_active_tracker, NULL);
+  (void)motor_spawn_detached(motion_active_tracker, NULL, WORKER_STACK);
 }
 
 static void daemonsetup() {
