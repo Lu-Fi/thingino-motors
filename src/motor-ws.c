@@ -351,6 +351,26 @@ static int send_ack(ws_client *c, long long id, const char *cmd, bool have_xy,
 }
 
 /* ------------------------------------------------------------------ *
+ * status sampling
+ * ------------------------------------------------------------------ */
+
+/* Status for a frame the client is owed right now - the "hello" greeting and
+ * an explicit "status" command. Those used to take the command lock
+ * unconditionally, which parks the connection thread for the whole of a
+ * homing sweep (~35 s): no PING answered, no stop read. During a long
+ * operation the driver is read without the lock instead, exactly as the move
+ * worker reads it all the time; the frame may then show a position mid-sweep,
+ * which is the truth. */
+static void status_now(struct motor_message *m) {
+  if (motor_ctl_status_try(m))
+    return;
+  if (motor_ctl_long_op())
+    motor_ctl_status_peek(m);
+  else
+    motor_ctl_status(m); /* a short command holds the lock; wait it out */
+}
+
+/* ------------------------------------------------------------------ *
  * access control
  * ------------------------------------------------------------------ */
 
@@ -608,6 +628,21 @@ static int handle_command(ws_client *c, const char *text) {
     speed = (int)v;
   }
 
+  /* A homing sweep or a config reload holds the command lock for seconds -
+   * homing for up to ~35. Every command below that needs the lock would park
+   * this thread for that long, reading nothing (not even "stop") and
+   * answering no PING, so it is refused up front instead. stop, ping, status
+   * and subscribe never wait on the lock for long; vector checks for itself,
+   * because releasing the stick is a stop and must always get through. The
+   * check is a hint, not a lock: a long operation starting a moment after it
+   * still makes the command wait, as it always did. */
+  if (strcmp(cmd, "stop") != 0 && strcmp(cmd, "ping") != 0 &&
+      strcmp(cmd, "status") != 0 && strcmp(cmd, "subscribe") != 0 &&
+      strcmp(cmd, "vector") != 0 && motor_ctl_long_op()) {
+    rc = send_error(c, id, "busy", "homing or config reload in progress");
+    goto out;
+  }
+
   if (strcmp(cmd, "move") == 0) {
     /* mode defaults to "rel": the hold-a-button jog is the overwhelmingly
      * common case and the one this whole change exists to make cheap. */
@@ -680,10 +715,16 @@ static int handle_command(ws_client *c, const char *text) {
     xv = (xv < -1000) ? -1000 : ((xv > 1000) ? 1000 : xv);
     yv = (yv < -1000) ? -1000 : ((yv > 1000) ? 1000 : yv);
 
-    if (!motor_ctl_vector((int)xv, (int)yv, speed, &sx, &sy)) {
+    switch (motor_ctl_vector((int)xv, (int)yv, speed, &sx, &sy)) {
+    case MOTOR_CTL_NO_LIMITS:
       rc = send_error(c, id, "no_limits",
                       "travel limits unknown, cannot drive a vector");
       goto out;
+    case MOTOR_CTL_BUSY:
+      rc = send_error(c, id, "busy", "homing or config reload in progress");
+      goto out;
+    default:
+      break;
     }
 
     /* x/y in this ack are the per-axis SPEEDS commanded, not a delta the way
@@ -731,7 +772,7 @@ static int handle_command(ws_client *c, const char *text) {
     rc = send_ack(c, id, "speed", false, 0, 0);
   } else if (strcmp(cmd, "status") == 0) {
     struct motor_message m;
-    motor_ctl_status(&m);
+    status_now(&m);
     rc = send_status(c, "status", &m);
   } else if (strcmp(cmd, "subscribe") == 0) {
     if (json_int(root, "interval_ms", &v)) {
@@ -747,7 +788,7 @@ static int handle_command(ws_client *c, const char *text) {
     rc = send_ack(c, id, "subscribe", false, 0, 0);
     if (rc == WS_OK && c->push_ms) {
       struct motor_message m;
-      motor_ctl_status(&m);
+      status_now(&m);
       rc = send_status(c, "status", &m);
       c->last_poll_ms = c->last_sent_ms = now_ms();
       c->last_x = m.x;
@@ -1093,7 +1134,7 @@ static void *conn_thread(void *arg) {
    * from a reconnect that resumed mid-stream. */
   {
     struct motor_message m;
-    motor_ctl_status(&m);
+    status_now(&m);
     if (send_status(c, "hello", &m) != WS_OK)
       goto done;
   }

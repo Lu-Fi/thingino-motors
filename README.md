@@ -214,6 +214,10 @@ if out of range rather than clamped.
 - `{"cmd":"stop"}` - immediate stop; also releases any held stick direction.
 - `{"cmd":"home"}` - two-phase homing, same as `ingenic-motor -r`. Runs on its
   own thread so `stop` stays reachable; a second one while it runs gets `busy`.
+  While homing or a config reload (`motors -R`) runs, every command that would
+  have to wait for it - `move`, `speed`, `home`, a `vector` deflection - is
+  answered with `busy` instead of stalling the connection; `stop`, `ping`,
+  `status`, `subscribe` and a centred `vector` always go through.
 - `{"cmd":"speed","speed":900}` - set the daemon's default speed.
 - `{"cmd":"status"}` - one status frame.
 - `{"cmd":"subscribe","interval_ms":150}` - server-driven status pushes.
@@ -382,6 +386,11 @@ preset, so it is set explicitly; 3.x already defaults there).
   is evicted. `ws_max_clients` counts authenticated connections, and the 503
   for a full house is sent after authentication over the client's own
   transport. The listener no longer lingers 500 ms on each refusal.
+- **Commands during homing or a reload stalled the connection.** Anything that
+  needs the command lock waited out the whole sweep (~30 s) without reading
+  frames or answering PINGs. `move`, `speed`, `home` and a `vector` deflection
+  now get `busy` at once; `status`, `subscribe` and the `hello` greeting read
+  the driver without the lock during such an operation.
 - **A transient `accept()` error closed the listener for good** (EMFILE,
   ENOBUFS, EPROTO, ...). The WebSocket listener now backs off 200 ms and
   retries.

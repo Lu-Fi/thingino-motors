@@ -1834,6 +1834,27 @@ bool motor_ctl_trylock(void) {
 
 void motor_ctl_unlock(void) { pthread_mutex_unlock(&command_lock); }
 
+// Set by the two handlers that hold command_lock for seconds rather than
+// milliseconds, while they hold it. Own mutex: it has to be readable exactly
+// when command_lock is not available. See motor_ctl_long_op() in motor-ctl.h.
+static pthread_mutex_t long_op_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool long_op_active = false;
+
+static void long_op_set(bool on) {
+  pthread_mutex_lock(&long_op_lock);
+  long_op_active = on;
+  pthread_mutex_unlock(&long_op_lock);
+}
+
+bool motor_ctl_long_op(void) {
+  bool on;
+
+  pthread_mutex_lock(&long_op_lock);
+  on = long_op_active;
+  pthread_mutex_unlock(&long_op_lock);
+  return on;
+}
+
 int motor_ctl_resolve_speed(int requested_speed) {
   int request_speed;
 
@@ -2001,8 +2022,8 @@ static int vector_axis_speed(int deflection, int ref_speed) {
   return (int)(((double)ref_speed * pct) / 100.0);
 }
 
-bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
-                      int *speed_y_out) {
+int motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
+                     int *speed_y_out) {
   struct motor_message m;
   int dir_x, dir_y, prev_x, prev_y;
   int travel_x, travel_y, base, sx, sy, ex, ey;
@@ -2028,8 +2049,13 @@ bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
     // motor_ctl_stop() clears the latch itself, so a stick centred and pushed
     // out again starts from prev=0 and has to clear the engage threshold.
     motor_ctl_stop();
-    return true;
+    return MOTOR_CTL_OK;
   }
+
+  // Everything past here needs command_lock, which homing or a reload hold
+  // for seconds. Refuse rather than park the caller's connection thread on it.
+  if (motor_ctl_long_op())
+    return MOTOR_CTL_BUSY;
 
   motor_ctl_lock();
   motor_status_get(&m);
@@ -2049,7 +2075,7 @@ bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
   motor_ctl_unlock();
 
   if ((dir_x && travel_x <= 0) || (dir_y && travel_y <= 0))
-    return false;
+    return MOTOR_CTL_NO_LIMITS;
 
   sx = dir_x ? vector_axis_speed(vx, base) : 0;
   sy = dir_y ? vector_axis_speed(vy, base) : 0;
@@ -2121,7 +2147,7 @@ bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
     *speed_x_out = dir_x ? sx : 0;
   if (speed_y_out)
     *speed_y_out = dir_y ? sy : 0;
-  return true;
+  return MOTOR_CTL_OK;
 }
 
 void motor_ctl_absolute(int x, int got_x, int y, int got_y, int speed,
@@ -2271,6 +2297,7 @@ void motor_ctl_home(int speed) {
   struct motor_reset_data motor_reset_data;
 
   motor_ctl_lock();
+  long_op_set(true);
   motion_cancel_all(true);
   syslog(LOG_DEBUG, "== Enhanced homing (reset), please wait");
   write_motion_active_flag();
@@ -2281,6 +2308,7 @@ void motor_ctl_home(int speed) {
     motor_ioctl(MOTOR_RESET, &motor_reset_data);
   }
   remove_motion_active_flag();
+  long_op_set(false);
   motor_ctl_unlock();
 }
 
@@ -2288,6 +2316,10 @@ void motor_ctl_status(struct motor_message *out) {
   motor_ctl_lock();
   motor_status_get_logical(out);
   motor_ctl_unlock();
+}
+
+void motor_ctl_status_peek(struct motor_message *out) {
+  motor_status_get_logical(out);
 }
 
 bool motor_ctl_status_try(struct motor_message *out) {
@@ -2337,6 +2369,7 @@ bool motor_ctl_reload(struct motor_message *out) {
   bool reload_ok;
 
   motor_ctl_lock();
+  long_op_set(true);
 
   // Lets invert_x/invert_y (and speeds, accel, timeouts, pos_0,
   // joystick_sensitivity) take effect without restarting this process and,
@@ -2417,6 +2450,7 @@ bool motor_ctl_reload(struct motor_message *out) {
   if (!reload_ok)
     out->status = MOTOR_RELOAD_FAILED;
 
+  long_op_set(false);
   motor_ctl_unlock();
   return reload_ok;
 }

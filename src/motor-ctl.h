@@ -94,6 +94,13 @@ int motor_ctl_resolve_speed(int requested_speed);
 void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
                         int *applied_y);
 
+/* Result of motor_ctl_vector(). */
+enum {
+  MOTOR_CTL_OK = 0,
+  MOTOR_CTL_NO_LIMITS, /* travel limits unknown for an axis being pushed */
+  MOTOR_CTL_BUSY,      /* homing or a config reload holds the lock */
+};
+
 /* Continuous "analog stick" move. WebSocket only - the AF_UNIX protocol has
  * no gesture that needs it.
  *
@@ -119,12 +126,15 @@ void motor_ctl_relative(int rel_x, int rel_y, int speed, int *applied_x,
  * steps/s, and `motors -s 900` mid-move took it to ~910 steps/s within one
  * one-second sample, with no stutter and no restart.
  *
- * Returns false when the travel limits are unknown for an axis the stick is
- * asking to move (x_max/y_max 0 and nothing configured): "go until the limit"
- * has no meaning then, and nothing was issued. speed_x/speed_y, when
- * non-NULL, receive the per-axis speeds actually commanded. */
-bool motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x,
-                      int *speed_y);
+ * Returns MOTOR_CTL_NO_LIMITS when the travel limits are unknown for an axis
+ * the stick is asking to move (x_max/y_max 0 and nothing configured): "go
+ * until the limit" has no meaning then, and nothing was issued. Returns
+ * MOTOR_CTL_BUSY, again with nothing issued, when a deflection arrives during
+ * a long operation (see motor_ctl_long_op()); a CENTRED stick is a stop and
+ * is never refused. speed_x/speed_y, when non-NULL, receive the per-axis
+ * speeds actually commanded. */
+int motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x,
+                     int *speed_y);
 
 /* Absolute move ('d'/'h'). x/y are logical; got_x/got_y say whether the
  * caller actually specified that axis (0 = keep the current position). The
@@ -155,6 +165,20 @@ void motor_ctl_status(struct motor_message *out);
  * stop it probably wants. Skipping the sample is strictly better than
  * freezing the socket. */
 bool motor_ctl_status_try(struct motor_message *out);
+
+/* Status read WITHOUT the command lock, the way the move worker has always
+ * read the driver. For a frame a client is owed during a long operation,
+ * where waiting for the lock means waiting out the whole sweep. It can
+ * observe a configuration mid-reload; the frame is then briefly inaccurate,
+ * which is all a status frame can be. */
+void motor_ctl_status_peek(struct motor_message *out);
+
+/* True while homing or a config reload holds the command lock. Those two hold
+ * it for seconds (homing up to ~35 s); everything else for milliseconds. A
+ * hint for the WS frontend to answer "busy" instead of parking a connection
+ * thread on the lock - not a lock itself: an operation may start right after
+ * this returned false. */
+bool motor_ctl_long_op(void);
 
 void motor_ctl_set_speed(int speed); /* 's' */
 void motor_ctl_invert(char axis);    /* 'I', axis in {'x','y','b'} */
