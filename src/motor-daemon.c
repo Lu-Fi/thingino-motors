@@ -2005,7 +2005,7 @@ static int vector_axis_dir(int v, int prev) {
 // motors.joystick_sensitivity (g_cfg.joystick_curve_exp); see
 // parse_modern_layout() for range-checking, VECTOR_CURVE_EXP_DEFAULT
 // below for the fallback.
-static int vector_axis_speed(int deflection, int ref_speed) {
+static int vector_axis_speed(int deflection, int ref_speed, double curve_exp) {
   int mag = (deflection < 0) ? -deflection : deflection;
   double ratio, pct;
 
@@ -2016,7 +2016,7 @@ static int vector_axis_speed(int deflection, int ref_speed) {
 
   ratio = (double)(mag - VECTOR_DEADZONE) / (double)(1000 - VECTOR_DEADZONE);
   // Endpoints fixed: ratio 0 stays 0, ratio 1 stays 1.
-  ratio = pow(ratio, g_cfg.joystick_curve_exp);
+  ratio = pow(ratio, curve_exp);
   pct = VECTOR_MIN_SPEED_PCT + (100 - VECTOR_MIN_SPEED_PCT) * ratio;
 
   return (int)(((double)ref_speed * pct) / 100.0);
@@ -2027,6 +2027,7 @@ int motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
   struct motor_message m;
   int dir_x, dir_y, prev_x, prev_y;
   int travel_x, travel_y, base, sx, sy, ex, ey;
+  double curve_exp;
   bool direction_changed;
 
   // One read of the latched pair, reused for the hysteresis decision and for
@@ -2072,13 +2073,15 @@ int motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
              : (g_cfg.loaded && g_cfg.tilt.max_steps > 0)
                  ? g_cfg.tilt.max_steps
                  : 0;
+  // Copied under the lock: an 'R' reload rewrites g_cfg while holding it.
+  curve_exp = g_cfg.joystick_curve_exp;
   motor_ctl_unlock();
 
   if ((dir_x && travel_x <= 0) || (dir_y && travel_y <= 0))
     return MOTOR_CTL_NO_LIMITS;
 
-  sx = dir_x ? vector_axis_speed(vx, base) : 0;
-  sy = dir_y ? vector_axis_speed(vy, base) : 0;
+  sx = dir_x ? vector_axis_speed(vx, base, curve_exp) : 0;
+  sy = dir_y ? vector_axis_speed(vy, base, curve_exp) : 0;
   // An axis the stick is not asking to move inherits the other axis's speed
   // instead of keeping 0. Not cosmetic: motor_set_axis_speed() falls back to
   // the single-speed MOTOR_SPEED ioctl with min(x,y) on kernels without
@@ -2130,10 +2133,11 @@ int motor_ctl_vector(int vx, int vy, int ref_speed, int *speed_x_out,
     // twice caps each axis against its own without duplicating that rule.
     ex = sx;
     ey = sy;
+
+    // compute_axis_speeds() reads g_cfg, so it runs under the lock too.
+    motor_ctl_lock();
     compute_axis_speeds(sx, &ex, NULL);
     compute_axis_speeds(sy, NULL, &ey);
-
-    motor_ctl_lock();
     motor_set_axis_speed(ex, ey);
     motor_ctl_unlock();
   }
