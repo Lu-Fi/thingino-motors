@@ -1957,6 +1957,11 @@ static void motor_ctl_relative_ex(int rel_x, int rel_y, int speed,
 
   motor_status_get(&motor_message);
   {
+    // rel_x/rel_y are LOGICAL jog deltas, motor_message is RAW: bring the
+    // delta into the raw frame before clamping, otherwise an inverted axis
+    // is clamped against the wrong end and gets stuck there (+jog at raw max
+    // was cut to 0, so the axis could never leave the end it reached).
+    physical_delta_to_steps(&rel_x, &rel_y);
     int target_x = motor_message.x + rel_x;
     int target_y = motor_message.y + rel_y;
     int runtime_x_max =
@@ -2011,6 +2016,8 @@ static void motor_ctl_relative_ex(int rel_x, int rel_y, int speed,
 
     rel_x = target_x - motor_message.x;
     rel_y = target_y - motor_message.y;
+    // back to the logical frame (dispatch inverts again to raw)
+    physical_delta_to_steps(&rel_x, &rel_y);
 
     if (applied_x)
       *applied_x = rel_x;
